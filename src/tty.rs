@@ -415,9 +415,12 @@ mod sys {
         fn tcsetattr(fd: c_int, action: c_int, termios: *const u8) -> c_int;
         /// `int ioctl(int, unsigned long, ...)` from `sys/ioctl.h`.
         ///
-        /// Declared with the one pointer argument `TIOCGWINSZ` takes
-        /// (`struct winsize *` in `sys/ttycom.h`).
-        fn ioctl(fd: c_int, request: c_ulong, arg: *mut u8) -> c_int;
+        /// Variadic here because it is variadic there. On arm64 macOS a
+        /// variadic argument is passed on the stack and a named one in a
+        /// register, so declaring the third parameter by name made the
+        /// kernel read a pointer this code never wrote. The call failed and
+        /// the UI drew at its built-in size whatever the window was.
+        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
         /// `int sigaction(int, const struct sigaction *, struct sigaction *)`
         /// from `signal.h`.
         fn sigaction(sig: c_int, action: *const u8, previous: *mut u8) -> c_int;
@@ -458,9 +461,11 @@ mod sys {
 
     pub(super) fn window_size(fd: i32) -> io::Result<(u16, u16)> {
         let mut buf = [0u8; 8];
-        // SAFETY: `TIOCGWINSZ` writes `struct winsize` (8 bytes: row, col,
-        // xpixel, ypixel). `buf` is that size. The two `u16`s are copied
-        // with `from_ne_bytes`, so the buffer's alignment does not matter.
+        // SAFETY: `TIOCGWINSZ` takes one `struct winsize *` (`sys/ttycom.h`)
+        // and writes that struct (8 bytes: row, col, xpixel, ypixel). `buf`
+        // is that size and is passed as the one variadic argument. The two
+        // `u16`s are copied with `from_ne_bytes`, so the buffer's alignment
+        // does not matter.
         let rc = unsafe { ioctl(fd, TIOCGWINSZ, buf.as_mut_ptr()) };
         if rc != 0 {
             return Err(io::Error::last_os_error());

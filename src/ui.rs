@@ -1101,6 +1101,7 @@ fn escape_sequence(bytes: &[u8]) -> (Option<Key>, &[u8]) {
 #[must_use]
 pub fn render(model: &Model) -> String {
     let mut head = vec![title_line(model), rule_line(model)];
+    head.extend(scan_line(model));
     let (body, focus) = if model.mode == Mode::Help {
         (help_body(model), 0)
     } else {
@@ -1249,6 +1250,9 @@ fn drive(session: &Session<'_>) -> crate::Result<Option<String>> {
     let palette = palette_from(session.colorterm, session.term, session.no_color);
     let mut model = Model::new(volumes, Vec::new(), Vec::new(), palette, SystemTime::now());
     model.set_home(session.home);
+    // Open on what the tool is for. The volumes screen has one line of
+    // news, and the scan's results would be a keypress away from sight.
+    model.screen = Screen::Reclaim;
     model.set_grouped_rules(
         loaded
             .safe_rules
@@ -1257,10 +1261,7 @@ fn drive(session: &Session<'_>) -> crate::Result<Option<String>> {
             .map(|rule| rule.id.to_owned())
             .collect(),
     );
-    if let Ok((rows, cols)) = crate::tty::window_size(0) {
-        model.set_columns(usize::from(cols));
-        model.set_rows(usize::from(rows));
-    }
+    resize(&mut model);
 
     let raw = crate::tty::RawMode::enter(0, 1)
         .map_err(|source| crate::Error::io("set terminal mode", "/dev/tty", source))?;
@@ -1294,11 +1295,8 @@ fn drive(session: &Session<'_>) -> crate::Result<Option<String>> {
             return Ok(model.applied.take());
         }
         background.deliver(&mut model, &inbox);
-        if crate::tty::take_resized()
-            && let Ok((rows, cols)) = crate::tty::window_size(0)
-        {
-            model.set_columns(usize::from(cols));
-            model.set_rows(usize::from(rows));
+        if crate::tty::take_resized() {
+            resize(&mut model);
         }
         if model.revision != drawn {
             paint_frame(&model)?;
@@ -1353,6 +1351,20 @@ fn whole_prefix(bytes: &[u8]) -> usize {
         _ => false,
     };
     if unfinished { start } else { bytes.len() }
+}
+
+/// Takes the window size, when the terminal has one.
+///
+/// A pseudo-terminal nobody sized reports 0 by 0. That is "unknown", not a
+/// window with no cells, and the model keeps the size it has.
+fn resize(model: &mut Model) {
+    if let Ok((rows, cols)) = crate::tty::window_size(0)
+        && rows > 0
+        && cols > 0
+    {
+        model.set_columns(usize::from(cols));
+        model.set_rows(usize::from(rows));
+    }
 }
 
 fn paint_frame(model: &Model) -> crate::Result<()> {
@@ -2098,35 +2110,85 @@ fn usage_child(
     vec![heading, bar]
 }
 
+/// The three screens as tabs, the current one marked, and on the right
+/// what the scan is doing and how much is staged.
 fn title_line(model: &Model) -> String {
-    let name = match model.screen {
-        Screen::Volumes => "volumes",
-        Screen::Reclaim => "reclaim",
-        Screen::Usage => "usage",
-    };
-    let left = format!("disk-health  {name}");
+    let tabs = [
+        (Screen::Volumes, "1 volumes"),
+        (Screen::Reclaim, "2 reclaim"),
+        (Screen::Usage, "3 usage"),
+    ]
+    .map(|(screen, label)| {
+        if screen == model.screen {
+            (format!("[{label}]"), Ink::Accent)
+        } else {
+            (format!(" {label} "), Ink::Muted)
+        }
+    });
     let scan = match (&model.walking, &model.scan) {
         (Some(mount), _) => {
             format!("walking {}  {} dirs", mount.display(), model.walk_dirs)
         }
-        (_, ScanState::Running) => format!("scanning  {} dirs", model.scan_dirs),
+        (_, ScanState::Running) => "scanning".to_owned(),
         (_, ScanState::Done) => "scan done".to_owned(),
         (_, ScanState::Failed) => "scan failed".to_owned(),
     };
     let staged = format!("   staged {}", format_bytes(model.staged_bytes()));
-    let used = cells(&left) + cells(&scan) + cells(&staged);
-    let gap = " ".repeat(gap_width(model.columns, used));
 
+    let name = "disk-health ";
+    let used = cells(name)
+        + tabs
+            .iter()
+            .map(|(label, _)| cells(label) + 1)
+            .sum::<usize>()
+        + cells(&scan)
+        + cells(&staged);
+    let gap = " ".repeat(gap_width(model.columns, used));
     paint_line(
         model.palette,
         &[
-            (left.as_str(), Ink::Title),
+            (name, Ink::Title),
+            (" ", Ink::Text),
+            (tabs[0].0.as_str(), tabs[0].1),
+            (" ", Ink::Text),
+            (tabs[1].0.as_str(), tabs[1].1),
+            (" ", Ink::Text),
+            (tabs[2].0.as_str(), tabs[2].1),
             (gap.as_str(), Ink::Text),
             (scan.as_str(), Ink::Muted),
             (staged.as_str(), Ink::Safe),
         ],
         model.columns,
     )
+}
+
+/// What the scan has done so far, on every screen while it runs.
+///
+/// The scan is on another thread and can take a while. Without this line
+/// the only sign of it was a number in the corner of the title.
+fn scan_line(model: &Model) -> Option<String> {
+    if model.scan != ScanState::Running {
+        return None;
+    }
+    let rows = model.rows.len();
+    let found = model
+        .rows
+        .iter()
+        .fold(0u64, |sum, row| sum.saturating_add(row.bytes));
+    let noun = if rows == 1 { "row" } else { "rows" };
+    let mut text = format!(
+        "  scanning  {} project dirs walked, {rows} {noun} found ({})",
+        model.scan_dirs,
+        format_bytes(found)
+    );
+    if model.screen != Screen::Reclaim {
+        text.push_str("  press 2 to see them");
+    }
+    Some(paint_line(
+        model.palette,
+        &[(text.as_str(), Ink::Accent)],
+        model.columns,
+    ))
 }
 
 fn help_body(model: &Model) -> Vec<String> {
@@ -2182,7 +2244,7 @@ fn reclaim_body(model: &Model) -> (Vec<String>, usize) {
     let visible = model.visible();
     if visible.is_empty() {
         let text = match model.scan {
-            ScanState::Running => "  no reclaim rows yet",
+            ScanState::Running => "  rows appear here as the scan finds them",
             ScanState::Done => "  nothing to reclaim",
             ScanState::Failed => "  the scan failed before it found anything",
         };
@@ -2293,7 +2355,7 @@ fn reclaim_line(model: &Model, line: &[usize], selected: bool, largest: u64) -> 
     let state = format!(" {state:<18}");
     let age = line.iter().filter_map(|index| model.rows[*index].age).min();
     let facts = if model.columns >= ROW_RULE_MIN_COLUMNS {
-        format!("{:>5}  {:<16} ", age_text(age), first.rule)
+        format!("{:>5}  {:<22} ", age_text(age), first.rule)
     } else {
         format!("{:>5}  ", age_text(age))
     };
@@ -3516,7 +3578,7 @@ mod tests {
             children: Vec::new(),
         });
         let frame = render(&model);
-        assert!(frame.contains("disk-health  reclaim"), "{frame}");
+        assert!(frame.contains("[2 reclaim]"), "{frame}");
         assert!(frame.contains("confirm 1.5KiB"), "{frame}");
         assert!(frame.contains("press 3 to see it"), "{frame}");
     }
@@ -3664,7 +3726,15 @@ mod tests {
     fn title_follows_the_scan_and_a_walk() {
         let mut model = volume_model(10, Palette::Plain);
         model.set_scan_progress(4_000);
-        assert!(render(&model).contains("scanning  4000 dirs"));
+        let frame = render(&model);
+        assert!(
+            frame.contains("[1 volumes]  2 reclaim   3 usage"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("scanning  4000 project dirs walked, 0 rows found (0B)  press 2"),
+            "{frame}"
+        );
         model.finish_scan(&ScanSummary {
             unreadable: 3,
             roots_missing: 1,
@@ -3672,6 +3742,7 @@ mod tests {
         });
         let frame = render(&model);
         assert!(frame.contains("scan done"), "{frame}");
+        assert!(!frame.contains("project dirs walked"), "{frame}");
         assert!(frame.contains("3 unreadable, 1 root missing"), "{frame}");
 
         assert_eq!(
