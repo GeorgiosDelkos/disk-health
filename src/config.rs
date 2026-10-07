@@ -4,7 +4,16 @@
 //! Ages can only make a builtin rule older or younger. Zero is rejected:
 //! systemd-tmpfiles treats age `0` as unconditional deletion, and that is the
 //! setting that does not belong on a home directory.
+//!
+//! The denylist is compared as text, one path component at a time, ignoring
+//! case. The default macOS volume is case-insensitive, so `~/.SSH` is
+//! `~/.ssh` on disk. On a case-sensitive volume this denies a sibling that
+//! differs only by case, which is the safe direction. A path that reaches a
+//! denied directory through a symlink is only caught once it is canonical:
+//! [`resolve_home`], [`prepare_root`], and the exclude lines all resolve
+//! what exists before it is compared.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -24,6 +33,9 @@ const ABSOLUTE_DENY: &[&str] = &[
     "/sbin",
     "/opt/homebrew",
     "/Library",
+    "/Applications",
+    "/etc",
+    "/private/etc",
     "/private/var/vm",
     "/private/var/db",
     "/dev",
@@ -45,10 +57,14 @@ const HOME_DENY: &[&str] = &[
     "Library/Mobile Documents",
     "Library/CloudStorage",
     "Library/Application Support",
+    "Library/Preferences",
     ".ssh",
     ".gnupg",
     ".aws",
     ".kube",
+    ".docker",
+    ".config/gcloud",
+    ".netrc",
     ".config/disk-health",
     ".Trash",
 ];
@@ -121,7 +137,7 @@ pub fn load(home: &Path) -> Result<Loaded> {
         None => Vec::new(),
         Some(lines) => lines
             .iter()
-            .map(|line| expand(home, line))
+            .map(|line| expand(home, line).map(|path| settle(&path)))
             .collect::<Result<Vec<_>>>()?,
     };
 
@@ -182,10 +198,69 @@ pub fn deny_prefixes(home: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     prefixes
 }
 
+/// The home directory with symlinks resolved, so it compares equal to the
+/// canonical paths the scan produces. A home that does not exist is returned
+/// as given.
+///
+/// # Errors
+///
+/// Returns an error when the path exists but cannot be resolved.
+///
+/// # Examples
+///
+/// ```
+/// use disk_health::config::resolve_home;
+/// use std::path::Path;
+///
+/// let home = resolve_home(Path::new("/no/such/home")).unwrap();
+/// assert_eq!(home, Path::new("/no/such/home"));
+/// ```
+pub fn resolve_home(home: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(home) {
+        Ok(canonical) => Ok(canonical),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(normalize(home)),
+        Err(err) => Err(Error::io("resolve home", home, err)),
+    }
+}
+
+/// Splits requested project roots into the ones to walk and the ones refused.
+///
+/// A missing root is in the first list so the scan can report it.
+///
+/// # Errors
+///
+/// Returns an error when a root exists but cannot be resolved.
+///
+/// # Examples
+///
+/// ```
+/// use disk_health::config::prepare_roots;
+/// use std::path::PathBuf;
+///
+/// let deny = [PathBuf::from("/System")];
+/// let (walk, denied) = prepare_roots(&[PathBuf::from("/System/Library")], &deny).unwrap();
+/// assert!(walk.is_empty());
+/// assert_eq!(denied, [PathBuf::from("/System/Library")]);
+/// ```
+pub fn prepare_roots(
+    requested: &[PathBuf],
+    deny: &[PathBuf],
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut roots = Vec::new();
+    let mut denied = Vec::new();
+    for root in requested {
+        match prepare_root(root, deny)? {
+            RootStatus::Ready(path) | RootStatus::Missing(path) => roots.push(path),
+            RootStatus::Denied(path) => denied.push(path),
+        }
+    }
+    Ok((roots, denied))
+}
+
 /// Reports whether `path` is the same as a prefix or lives under one.
 ///
-/// `..` is resolved lexically before the comparison. Symlink targets of a
-/// project root are checked separately by [`prepare_root`].
+/// `..` is resolved lexically before the comparison, and names are compared
+/// without regard to case. Symlinks are not resolved here: pass a canonical path.
 ///
 /// # Examples
 ///
@@ -196,6 +271,7 @@ pub fn deny_prefixes(home: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
 /// let deny = deny_prefixes(Path::new("/Users/ada"), &[]);
 /// assert!(path_is_denied(Path::new("/usr/bin"), &deny));
 /// assert!(path_is_denied(Path::new("/Volumes/Source/.Trashes/501"), &deny));
+/// assert!(path_is_denied(Path::new("/Users/ada/.SSH/id_ed25519"), &deny));
 /// assert!(!path_is_denied(Path::new("/Users/ada/code"), &deny));
 /// ```
 #[must_use]
@@ -203,12 +279,34 @@ pub fn path_is_denied(path: &Path, prefixes: &[PathBuf]) -> bool {
     let path = normalize(path);
     if path.components().any(|component| {
         let name = component.as_os_str();
-        DENY_COMPONENTS.iter().any(|denied| name == *denied)
+        DENY_COMPONENTS
+            .iter()
+            .any(|denied| same_name(name, OsStr::new(denied)))
     }) {
         return true;
     }
 
-    prefixes.iter().any(|prefix| path.starts_with(prefix))
+    prefixes.iter().any(|prefix| is_under(&path, prefix))
+}
+
+/// [`Path::starts_with`], with each component compared by [`same_name`].
+fn is_under(path: &Path, prefix: &Path) -> bool {
+    let mut have = path.components();
+    prefix.components().all(|want| {
+        have.next()
+            .is_some_and(|have| same_name(have.as_os_str(), want.as_os_str()))
+    })
+}
+
+/// Whether a case-insensitive volume would treat the two names as one.
+fn same_name(left: &OsStr, right: &OsStr) -> bool {
+    if left == right {
+        return true;
+    }
+    let (left, right) = (left.to_string_lossy(), right.to_string_lossy());
+    left.chars()
+        .flat_map(char::to_lowercase)
+        .eq(right.chars().flat_map(char::to_lowercase))
 }
 
 /// Directory names that are never candidates, on any volume.
@@ -384,6 +482,12 @@ fn expand(home: &Path, line: &str) -> Result<PathBuf> {
     }
 }
 
+/// Resolves an exclude line when it exists, so a line that names a symlink or
+/// uses a different case still matches the canonical paths the walk produces.
+fn settle(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| normalize(path))
+}
+
 fn read_lines(path: &Path) -> Result<Option<Vec<String>>> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -415,6 +519,35 @@ mod tests {
         let deny = vec![PathBuf::from("/safe")];
         assert!(path_is_denied(Path::new("/safe/../safe/secret"), &deny));
         assert!(!path_is_denied(Path::new("/safe/../other"), &deny));
+    }
+
+    #[test]
+    fn deny_ignores_case_and_still_splits_on_components() {
+        let deny = deny_prefixes(Path::new("/Users/ada"), &[]);
+        assert!(path_is_denied(Path::new("/system/Library"), &deny));
+        assert!(path_is_denied(
+            Path::new("/users/ADA/library/keychains/login"),
+            &deny
+        ));
+        assert!(path_is_denied(Path::new("/Volumes/X/.trashes/501"), &deny));
+        assert!(!path_is_denied(Path::new("/Users/ada/Librarian"), &deny));
+        assert!(!path_is_denied(Path::new("/usrlocal"), &deny));
+    }
+
+    #[test]
+    fn exclude_line_matches_the_canonical_spelling() {
+        let home = std::env::temp_dir().join(format!("disk-health-settle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let kept = home.join("Kept");
+        fs::create_dir_all(&kept).unwrap();
+        fs::create_dir_all(home.join(".config/disk-health")).unwrap();
+        std::os::unix::fs::symlink(&kept, home.join("alias")).unwrap();
+        fs::write(home.join(".config/disk-health/exclude"), "~/alias\n").unwrap();
+
+        let loaded = load(&home).unwrap();
+        let canonical = fs::canonicalize(&kept).unwrap();
+        assert!(path_is_denied(&canonical.join("target"), &loaded.deny));
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

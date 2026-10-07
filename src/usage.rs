@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::json;
-use crate::walk::{Fs, Kind, measure};
+use crate::walk::{EntryMeta, Fs, Kind, measure};
 
 /// How many directory levels below the root are expanded.
 pub const DEFAULT_DEPTH: u32 = 4;
@@ -27,6 +27,9 @@ pub struct UsageNode {
     /// Children, largest first. Empty when `depth` stopped the expansion.
     pub children: Vec<Self>,
 }
+
+/// Called with the number of directories expanded so far.
+pub type Progress<'a> = &'a (dyn Fn(u64) + Sync);
 
 /// Walks `root` without staging anything.
 ///
@@ -46,14 +49,25 @@ pub struct UsageNode {
 /// let fs = MemFs::new();
 /// fs.dir("/vol", 1, SystemTime::UNIX_EPOCH);
 /// fs.file("/vol/blob", 1, 4, SystemTime::UNIX_EPOCH);
-/// let tree = walk(&fs, Path::new("/vol"), 4).unwrap();
+/// let tree = walk(&fs, Path::new("/vol"), 4, None).unwrap();
 /// assert_eq!(tree.apparent_bytes, 4);
 /// ```
-pub fn walk(fs: &dyn Fs, root: &Path, depth: u32) -> Result<UsageNode> {
+pub fn walk(
+    fs: &dyn Fs,
+    root: &Path,
+    depth: u32,
+    progress: Option<Progress<'_>>,
+) -> Result<UsageNode> {
     refuse(root)?;
     let meta = fs.meta(root)?;
-    let mut seen = HashSet::new();
-    Ok(descend(fs, root, meta.dev, depth, &mut seen))
+    let mut walker = Walker {
+        fs,
+        root_dev: meta.dev,
+        seen: HashSet::new(),
+        expanded: 0,
+        progress,
+    };
+    Ok(walker.node(root.to_path_buf(), &meta, depth))
 }
 
 /// JSON document for a usage tree. It has no `staged` and no `tier` key.
@@ -100,59 +114,76 @@ fn refuse(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn descend(
-    fs: &dyn Fs,
-    path: &Path,
+struct Walker<'a> {
+    fs: &'a dyn Fs,
     root_dev: u64,
-    depth: u32,
-    seen: &mut HashSet<(u64, u64)>,
-) -> UsageNode {
-    let Ok(meta) = fs.meta(path) else {
-        return leaf(path, 0);
-    };
-    if meta.kind == Kind::Symlink || meta.is_dataless() || meta.dev != root_dev {
-        return leaf(path, 0);
-    }
-    if meta.kind == Kind::File {
-        let bytes = if seen.insert((meta.dev, meta.ino)) {
-            meta.len
-        } else {
-            0
-        };
-        return leaf(path, bytes);
-    }
-    if meta.kind != Kind::Directory {
-        return leaf(path, 0);
-    }
-    if depth == 0 {
-        let bytes = measure(fs, path, &meta).map_or(0, |measured| measured.apparent_bytes);
-        return leaf(path, bytes);
+    /// Hardlinked files already counted. A file with one link cannot repeat.
+    seen: HashSet<(u64, u64)>,
+    expanded: u64,
+    progress: Option<Progress<'a>>,
+}
+
+impl Walker<'_> {
+    fn node(&mut self, path: PathBuf, meta: &EntryMeta, depth: u32) -> UsageNode {
+        if meta.kind == Kind::Symlink || meta.is_dataless() || meta.dev != self.root_dev {
+            return leaf(path, 0);
+        }
+        match meta.kind {
+            Kind::File => {
+                let repeat = meta.nlink > 1 && !self.seen.insert((meta.dev, meta.ino));
+                leaf(path, if repeat { 0 } else { meta.len })
+            }
+            Kind::Directory if depth == 0 => {
+                let bytes =
+                    measure(self.fs, &path, meta).map_or(0, |measured| measured.apparent_bytes);
+                leaf(path, bytes)
+            }
+            Kind::Directory => self.expand(path, depth),
+            Kind::Symlink | Kind::Other => leaf(path, 0),
+        }
     }
 
-    let names = fs.read_dir(path).unwrap_or_default();
-    let mut children = Vec::new();
-    let mut total: u64 = 0;
-    for name in names {
-        let child = descend(fs, &path.join(name), root_dev, depth - 1, seen);
-        total = total.saturating_add(child.apparent_bytes);
-        children.push(child);
-    }
-    children.sort_by(|left, right| {
-        right
-            .apparent_bytes
-            .cmp(&left.apparent_bytes)
-            .then(left.path.cmp(&right.path))
-    });
-    UsageNode {
-        path: path.to_path_buf(),
-        apparent_bytes: total,
-        children,
+    fn expand(&mut self, path: PathBuf, depth: u32) -> UsageNode {
+        self.expanded = self.expanded.saturating_add(1);
+        if let Some(progress) = self.progress {
+            progress(self.expanded);
+        }
+
+        let Ok(listing) = self.fs.read_dir(&path) else {
+            return leaf(path, 0);
+        };
+        // A mount point looks like a plain directory in its parent's listing.
+        if listing.dev != self.root_dev {
+            return leaf(path, 0);
+        }
+
+        let mut children = Vec::new();
+        let mut total: u64 = 0;
+        for entry in listing.entries {
+            let Some(meta) = entry.meta else {
+                continue;
+            };
+            let child = self.node(path.join(entry.name), &meta, depth - 1);
+            total = total.saturating_add(child.apparent_bytes);
+            children.push(child);
+        }
+        children.sort_by(|left, right| {
+            right
+                .apparent_bytes
+                .cmp(&left.apparent_bytes)
+                .then(left.path.cmp(&right.path))
+        });
+        UsageNode {
+            path,
+            apparent_bytes: total,
+            children,
+        }
     }
 }
 
-fn leaf(path: &Path, apparent_bytes: u64) -> UsageNode {
+fn leaf(path: PathBuf, apparent_bytes: u64) -> UsageNode {
     UsageNode {
-        path: path.to_path_buf(),
+        path,
         apparent_bytes,
         children: Vec::new(),
     }
@@ -224,7 +255,7 @@ mod tests {
         fs.file("/vol/blob", 1, 4, when);
         fs.file("/secret", 1, 100, when);
         fs.symlink("/vol/link", when);
-        let tree = walk(&fs, Path::new("/vol"), 4).unwrap();
+        let tree = walk(&fs, Path::new("/vol"), 4, None).unwrap();
         let json = to_json(&tree);
         assert!(!json.contains("\"staged\""), "{json}");
         assert!(!json.contains("\"tier\""), "{json}");
@@ -246,14 +277,14 @@ mod tests {
         fs.dir("/vol/cloud", 1, when);
         fs.set_flags(Path::new("/vol/cloud"), SF_DATALESS);
         fs.file("/vol/cloud/hidden", 1, 80, when);
-        let tree = walk(&fs, Path::new("/vol"), 4).unwrap();
+        let tree = walk(&fs, Path::new("/vol"), 4, None).unwrap();
         assert_eq!(tree.apparent_bytes, 0);
     }
 
     #[test]
     fn system_volume_is_refused() {
         let fs = MemFs::new();
-        let err = walk(&fs, Path::new("/System"), 4).unwrap_err();
+        let err = walk(&fs, Path::new("/System"), 4, None).unwrap_err();
         assert!(err.to_string().contains("refuses"));
     }
 }

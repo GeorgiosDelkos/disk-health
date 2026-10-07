@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::time::SystemTime;
 
-use crate::config::{self, RootStatus};
+use crate::config;
 use crate::error::{Error, Result};
 use crate::git::{SystemGit, SystemWorktree};
 use crate::log::FileLog;
@@ -20,7 +20,7 @@ use crate::trash::{self, ApplyRequest, FsRename, PurgeRequest, RestoreRequest};
 use crate::tty::{self, Signals};
 use crate::ui::{self, Session};
 use crate::usage::{self, UsageNode};
-use crate::volumes::{self, Volume};
+use crate::volumes;
 use crate::walk::{Fs, RealFs};
 
 const HELP: &str = "\
@@ -423,14 +423,15 @@ fn unknown_flag(flag: &str) -> Error {
 }
 
 fn resolve_home(home: Option<&Path>) -> Result<PathBuf> {
-    match home {
-        Some(home) => Ok(home.to_path_buf()),
+    let home = match home {
+        Some(home) => home.to_path_buf(),
         None => std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| Error::Config {
                 message: "HOME is not set; pass --home".to_owned(),
-            }),
-    }
+            })?,
+    };
+    config::resolve_home(&home)
 }
 
 fn hostname() -> String {
@@ -507,15 +508,7 @@ fn prepare_roots(
         ProjectRoots::FromConfig => &loaded.roots,
         ProjectRoots::Replace(roots) => roots,
     };
-    let mut roots = Vec::new();
-    let mut denied = Vec::new();
-    for root in paths {
-        match config::prepare_root(root, &loaded.deny)? {
-            RootStatus::Ready(path) | RootStatus::Missing(path) => roots.push(path),
-            RootStatus::Denied(path) => denied.push(path),
-        }
-    }
-    Ok((roots, denied))
+    config::prepare_roots(paths, &loaded.deny)
 }
 
 fn write_plan(report: &crate::scan::Report, path: &Path, now: SystemTime) -> Result<()> {
@@ -568,6 +561,8 @@ fn execute_apply(flags: &ApplyFlags) -> Result<i32> {
         home_dev: home_meta.dev,
         uid: volumes::current_uid(),
         deny: &loaded.deny,
+        safe_rules: &loaded.safe_rules,
+        project_rules: &loaded.project_rules,
         fs: &filesystem,
         renamer: &renamer,
         log: &mut log,
@@ -622,7 +617,7 @@ fn execute_purge(flags: &HomeFlags) -> Result<i32> {
 fn execute_usage(flags: &UsageFlags) -> Result<i32> {
     let home = resolve_home(flags.home.as_deref())?;
     let volume = choose_volume(&home, flags.volume.as_deref())?;
-    let tree = usage::walk(&RealFs, &volume, usage::DEFAULT_DEPTH)?;
+    let tree = usage::walk(&RealFs, &volume, usage::DEFAULT_DEPTH, None)?;
     match flags.format {
         Format::Json => println!("{}", usage::to_json(&tree)),
         Format::Text => print_usage(&tree, 0),
@@ -635,13 +630,12 @@ fn choose_volume(home: &Path, requested: Option<&Path>) -> Result<PathBuf> {
         return Ok(volume.to_path_buf());
     }
     let mounts = volumes::list_mounts()?;
-    home_mount(home, &mounts).ok_or_else(|| Error::Usage {
-        message: format!("pass --volume; home is not under a walkable mount\n{HELP}"),
-    })
-}
-
-fn home_mount(home: &Path, mounts: &[Volume]) -> Option<PathBuf> {
-    volumes::home_volume(home, mounts).map(|volume| volume.mount.clone())
+    let home_dev = RealFs.meta(home)?.dev;
+    volumes::home_volume(home_dev, &mounts)
+        .map(|volume| volume.mount.clone())
+        .ok_or_else(|| Error::Usage {
+            message: format!("pass --volume; home is not on a walkable mount\n{HELP}"),
+        })
 }
 
 #[allow(clippy::print_stdout, reason = "the usage tree is stdout")]

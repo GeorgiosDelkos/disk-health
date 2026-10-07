@@ -5,9 +5,11 @@
 //! are not findings. [`crate::review`] owns that inventory, and [`Report::review`]
 //! starts empty so a scan cannot smuggle those rows into a plan.
 
-use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::{OsStr, OsString};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -214,8 +216,8 @@ impl std::fmt::Debug for ScanOptions<'_> {
 /// assert!(report.findings.is_empty());
 /// ```
 pub fn scan(opts: &ScanOptions<'_>) -> Result<Report> {
-    let mut chunk = eval_safe_rules(opts)?;
-    chunk.merge(discover_projects(opts));
+    let git = GitCache::new(opts.git);
+    let mut chunk = run_workers(opts, &git)?;
 
     chunk.findings.sort_by(|left, right| {
         left.tier
@@ -237,6 +239,107 @@ pub fn scan(opts: &ScanOptions<'_>) -> Result<Report> {
     })
 }
 
+/// Most threads that measure project candidates at once.
+///
+/// The work is waiting on directory reads. Past a handful of readers a
+/// spinning disk only seeks more.
+const MAX_MEASURERS: usize = 8;
+
+/// Runs the three kinds of work side by side.
+///
+/// Each safe rule has a thread, as before. The calling thread walks the
+/// project roots, which is cheap, and hands every candidate it finds to a
+/// pool that does the expensive part: measuring the tree and asking `git`.
+fn run_workers(opts: &ScanOptions<'_>, git: &GitCache<'_>) -> Result<Chunk> {
+    let (tx, rx) = mpsc::channel();
+    let rx = Mutex::new(rx);
+
+    thread::scope(|scope| {
+        // Owned by this closure so that every way out of it, including `?`,
+        // hangs up the channel. The pool waits on that, and the scope waits
+        // on the pool.
+        let tx = tx;
+        let mut handles = Vec::new();
+
+        let measurers = thread::available_parallelism().map_or(1, NonZero::get);
+        for _ in 0..measurers.min(MAX_MEASURERS) {
+            handles.push(spawn(scope, opts, || measure_queue(opts, git, &rx))?);
+        }
+        for rule in opts.safe_rules {
+            handles.push(spawn(scope, opts, move || eval_safe(opts, git, rule))?);
+        }
+
+        let mut merged = discover_projects(opts, &tx);
+        drop(tx);
+        for handle in handles {
+            merged.merge(handle.join().expect("scan worker panicked"));
+        }
+        Ok(merged)
+    })
+}
+
+fn spawn<'scope>(
+    scope: &'scope thread::Scope<'scope, '_>,
+    opts: &ScanOptions<'_>,
+    work: impl FnOnce() -> Chunk + Send + 'scope,
+) -> Result<thread::ScopedJoinHandle<'scope, Chunk>> {
+    thread::Builder::new()
+        .spawn_scoped(scope, work)
+        .map_err(|source| Error::io("spawn scan worker", opts.home, source))
+}
+
+fn measure_queue(
+    opts: &ScanOptions<'_>,
+    git: &GitCache<'_>,
+    queue: &Mutex<mpsc::Receiver<Candidate>>,
+) -> Chunk {
+    let mut chunk = Chunk::default();
+    loop {
+        // The guard is dropped before the candidate is measured, so the
+        // pool only queues up to take the next one.
+        let next = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        let Ok(candidate) = next else {
+            return chunk;
+        };
+        consider(&mut chunk, opts, git, &candidate);
+    }
+}
+
+/// One `git status` per project directory, however many rules match there.
+struct GitCache<'a> {
+    probe: &'a dyn GitProbe,
+    seen: Mutex<HashMap<PathBuf, GitTree>>,
+}
+
+impl<'a> GitCache<'a> {
+    fn new(probe: &'a dyn GitProbe) -> Self {
+        Self {
+            probe,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn status(&self, project: &Path) -> GitTree {
+        if let Some(known) = self.lock().get(project) {
+            return *known;
+        }
+        // Not held across the probe. Two workers can both ask about the same
+        // project once, which costs a second `git status` and nothing else.
+        let status = self.probe.status(project);
+        self.lock().insert(project.to_path_buf(), status);
+        status
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, GitTree>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 #[derive(Default)]
 struct Chunk {
     findings: Vec<Finding>,
@@ -254,110 +357,44 @@ impl Chunk {
         self.roots_missing.extend(other.roots_missing);
         self.roots_denied.extend(other.roots_denied);
     }
+
+    fn note_unreadable(&mut self) {
+        self.unreadable = self.unreadable.saturating_add(1);
+    }
 }
 
-fn eval_safe_rules(opts: &ScanOptions<'_>) -> Result<Chunk> {
-    thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for rule in opts.safe_rules {
-            let handle = thread::Builder::new()
-                .spawn_scoped(scope, || eval_safe(opts, rule))
-                .map_err(|source| Error::io("spawn scan worker", opts.home, source))?;
-            handles.push(handle);
-        }
-
-        let mut merged = Chunk::default();
-        for handle in handles {
-            merged.merge(handle.join().expect("safe-rule scan panicked"));
-        }
-        Ok(merged)
-    })
-}
-
-fn eval_safe(opts: &ScanOptions<'_>, rule: &SafeRule) -> Chunk {
+fn eval_safe(opts: &ScanOptions<'_>, git: &GitCache<'_>, rule: &SafeRule) -> Chunk {
     let mut chunk = Chunk::default();
+    let relative = match rule.anchor {
+        SafeAnchor::Directory(relative) | SafeAnchor::Files(relative) => relative,
+    };
+    // Resolved before the denylist sees it. `~/.cache` may be a symlink, and
+    // the rule is about where the bytes are, not about the spelling.
+    let anchor = match opts.fs.canonical(&opts.home.join(relative)) {
+        Ok(anchor) => anchor,
+        Err(err) if err.is_not_found() => return chunk,
+        Err(_) => {
+            chunk.note_unreadable();
+            return chunk;
+        }
+    };
+
     match rule.anchor {
-        SafeAnchor::Directory(relative) => eval_directory(&mut chunk, opts, rule, relative),
-        SafeAnchor::Files(relative) => eval_aged_files(&mut chunk, opts, rule, relative),
+        SafeAnchor::Directory(_) => {
+            let candidate = safe_candidate(opts, rule, anchor, true);
+            consider(&mut chunk, opts, git, &candidate);
+        }
+        SafeAnchor::Files(_) => eval_aged_files(&mut chunk, opts, git, rule, &anchor),
     }
     chunk
 }
 
-fn eval_directory(chunk: &mut Chunk, opts: &ScanOptions<'_>, rule: &SafeRule, relative: &str) {
-    let path = opts.home.join(relative);
-    consider(
-        chunk,
-        opts,
-        Candidate {
-            rule: rule.id,
-            tier: Tier::Safe,
-            path: &path,
-            min_age: rule.min_age,
-            regenerate: rule.regenerate,
-            rationale: rule.rationale,
-            marker: None,
-            project: None,
-            directory: true,
-        },
-    );
-}
-
-fn eval_aged_files(chunk: &mut Chunk, opts: &ScanOptions<'_>, rule: &SafeRule, relative: &str) {
-    let dir = opts.home.join(relative);
-    if path_is_denied(&dir, opts.deny) {
-        return;
-    }
-
-    let meta = match opts.fs.meta(&dir) {
-        Ok(meta) => meta,
-        Err(err) if err.is_not_found() => return,
-        Err(_) => {
-            chunk.unreadable = chunk.unreadable.saturating_add(1);
-            return;
-        }
-    };
-    if meta.is_dataless() || meta.kind == Kind::Symlink {
-        return;
-    }
-    if meta.kind == Kind::File {
-        consider_known(chunk, opts, file_candidate(rule, &dir), &meta);
-        return;
-    }
-    if meta.kind != Kind::Directory {
-        return;
-    }
-
-    let names = match opts.fs.read_dir(&dir) {
-        Ok(names) => names,
-        Err(err) if err.is_not_found() => return,
-        Err(_) => {
-            chunk.unreadable = chunk.unreadable.saturating_add(1);
-            return;
-        }
-    };
-
-    for name in names {
-        let path = dir.join(&name);
-        if path_is_denied(&path, opts.deny) {
-            continue;
-        }
-
-        let child = match opts.fs.meta(&path) {
-            Ok(child) => child,
-            Err(err) if err.is_not_found() => continue,
-            Err(_) => {
-                chunk.unreadable = chunk.unreadable.saturating_add(1);
-                continue;
-            }
-        };
-        // Subdirectories can hold tool state. Only loose files are candidates.
-        if child.kind == Kind::File && !child.is_dataless() {
-            consider_known(chunk, opts, file_candidate(rule, &path), &child);
-        }
-    }
-}
-
-fn file_candidate<'a>(rule: &'a SafeRule, path: &'a Path) -> Candidate<'a> {
+fn safe_candidate(
+    opts: &ScanOptions<'_>,
+    rule: &SafeRule,
+    path: PathBuf,
+    directory: bool,
+) -> Candidate {
     Candidate {
         rule: rule.id,
         tier: Tier::Safe,
@@ -367,11 +404,75 @@ fn file_candidate<'a>(rule: &'a SafeRule, path: &'a Path) -> Candidate<'a> {
         rationale: rule.rationale,
         marker: None,
         project: None,
-        directory: false,
+        directory,
+        locks: safe_locks(opts.home, rule),
     }
 }
 
-fn discover_projects(opts: &ScanOptions<'_>) -> Chunk {
+fn safe_locks(home: &Path, rule: &SafeRule) -> Vec<PathBuf> {
+    rule.locks.iter().map(|lock| home.join(lock)).collect()
+}
+
+fn eval_aged_files(
+    chunk: &mut Chunk,
+    opts: &ScanOptions<'_>,
+    git: &GitCache<'_>,
+    rule: &SafeRule,
+    dir: &Path,
+) {
+    if path_is_denied(dir, opts.deny) {
+        return;
+    }
+
+    let meta = match opts.fs.meta(dir) {
+        Ok(meta) => meta,
+        Err(err) if err.is_not_found() => return,
+        Err(_) => {
+            chunk.note_unreadable();
+            return;
+        }
+    };
+    if meta.is_dataless() || meta.kind == Kind::Symlink {
+        return;
+    }
+    if meta.kind == Kind::File {
+        let candidate = safe_candidate(opts, rule, dir.to_path_buf(), false);
+        consider_known(chunk, opts, git, &candidate, &meta);
+        return;
+    }
+    if meta.kind != Kind::Directory {
+        return;
+    }
+
+    let listing = match opts.fs.read_dir(dir) {
+        Ok(listing) => listing,
+        Err(err) if err.is_not_found() => return,
+        Err(_) => {
+            chunk.note_unreadable();
+            return;
+        }
+    };
+
+    for entry in listing.entries {
+        let Some(child) = entry.meta else {
+            chunk.note_unreadable();
+            continue;
+        };
+        // Subdirectories can hold tool state. Only loose files are candidates.
+        if child.kind != Kind::File || child.is_dataless() {
+            continue;
+        }
+
+        let path = dir.join(&entry.name);
+        if path_is_denied(&path, opts.deny) {
+            continue;
+        }
+        let candidate = safe_candidate(opts, rule, path, false);
+        consider_known(chunk, opts, git, &candidate, &child);
+    }
+}
+
+fn discover_projects(opts: &ScanOptions<'_>, queue: &mpsc::Sender<Candidate>) -> Chunk {
     let mut chunk = Chunk::default();
     for root in opts.roots {
         if path_is_denied(root, opts.deny) {
@@ -383,134 +484,136 @@ fn discover_projects(opts: &ScanOptions<'_>) -> Chunk {
             Err(err) if err.is_not_found() => {
                 chunk.roots_missing.push(root.clone());
             }
-            Err(_) => {
-                chunk.unreadable = chunk.unreadable.saturating_add(1);
-            }
+            Err(_) => chunk.note_unreadable(),
             Ok(meta) if meta.kind != Kind::Directory || meta.is_dataless() => {}
-            Ok(meta) => walk_project(opts, root, 0, meta.dev, &mut chunk),
+            Ok(meta) => {
+                let walk = ProjectWalk {
+                    opts,
+                    queue,
+                    root_dev: meta.dev,
+                };
+                walk.visit(root, 0, &mut chunk);
+            }
         }
     }
     chunk
 }
 
-fn walk_project(opts: &ScanOptions<'_>, dir: &Path, depth: u32, root_dev: u64, chunk: &mut Chunk) {
-    if depth > MAX_PROJECT_DEPTH || path_is_denied(dir, opts.deny) {
-        return;
-    }
+struct ProjectWalk<'a, 'opts> {
+    opts: &'a ScanOptions<'opts>,
+    queue: &'a mpsc::Sender<Candidate>,
+    root_dev: u64,
+}
 
-    chunk.dirs_visited = chunk.dirs_visited.saturating_add(1);
-    if let Some(progress) = opts.progress {
-        progress(chunk.dirs_visited);
-    }
-
-    let Some(children) = list_children(opts.fs, dir, chunk) else {
-        return;
-    };
-    consider_project_rules(opts, dir, &children, chunk);
-    if depth == MAX_PROJECT_DEPTH {
-        return;
-    }
-
-    for (name, meta) in &children.dirs {
-        if pruned(name) || meta.dev != root_dev || meta.is_dataless() {
-            continue;
+impl ProjectWalk<'_, '_> {
+    fn visit(&self, dir: &Path, depth: u32, chunk: &mut Chunk) {
+        if depth > MAX_PROJECT_DEPTH || path_is_denied(dir, self.opts.deny) {
+            return;
         }
-        walk_project(
-            opts,
-            &dir.join(name),
-            depth.saturating_add(1),
-            root_dev,
-            chunk,
-        );
+
+        chunk.dirs_visited = chunk.dirs_visited.saturating_add(1);
+        if let Some(progress) = self.opts.progress {
+            progress(chunk.dirs_visited);
+        }
+
+        let Some(children) = list_children(self.opts.fs, dir, chunk) else {
+            return;
+        };
+        // A mount point looks like a plain directory in its parent's listing.
+        if children.dev != self.root_dev {
+            return;
+        }
+        self.match_rules(dir, &children);
+        if depth == MAX_PROJECT_DEPTH {
+            return;
+        }
+
+        for (name, meta) in &children.dirs {
+            if pruned(name) || meta.dev != self.root_dev || meta.is_dataless() {
+                continue;
+            }
+            self.visit(&dir.join(name), depth.saturating_add(1), chunk);
+        }
+    }
+
+    fn match_rules(&self, dir: &Path, children: &Children) {
+        for rule in self.opts.project_rules {
+            let Some(marker) = matched_marker(rule, &children.files) else {
+                continue;
+            };
+            let Some((name, meta)) = children
+                .dirs
+                .iter()
+                .find(|(name, _)| name.as_os_str() == rule.child)
+            else {
+                continue;
+            };
+            if meta.is_dataless() {
+                continue;
+            }
+
+            let path = dir.join(name);
+            if !written_by_tool(self.opts.fs, &path, rule) {
+                continue;
+            }
+            let candidate = Candidate {
+                rule: rule.id,
+                tier: Tier::Caution,
+                locks: project_locks(self.opts.fs, &path, rule),
+                path,
+                min_age: rule.min_age,
+                regenerate: Some(rule.regenerate),
+                rationale: rule.rationale,
+                marker: Some(dir.join(marker)),
+                project: Some(dir.to_path_buf()),
+                directory: true,
+            };
+            self.queue
+                .send(candidate)
+                .expect("the receiver is owned by the caller of the scope");
+        }
     }
 }
 
 struct Children {
-    files: BTreeSet<std::ffi::OsString>,
-    dirs: Vec<(std::ffi::OsString, EntryMeta)>,
+    dev: u64,
+    files: BTreeSet<OsString>,
+    dirs: Vec<(OsString, EntryMeta)>,
 }
 
 fn list_children(fs: &dyn Fs, dir: &Path, chunk: &mut Chunk) -> Option<Children> {
-    let names = match fs.read_dir(dir) {
-        Ok(names) => names,
+    let listing = match fs.read_dir(dir) {
+        Ok(listing) => listing,
         Err(err) if err.is_not_found() => return None,
         Err(_) => {
-            chunk.unreadable = chunk.unreadable.saturating_add(1);
+            chunk.note_unreadable();
             return None;
         }
     };
 
     let mut children = Children {
+        dev: listing.dev,
         files: BTreeSet::new(),
         dirs: Vec::new(),
     };
-    for name in names {
-        let meta = match fs.meta(&dir.join(&name)) {
-            Ok(meta) => meta,
-            Err(err) if err.is_not_found() => continue,
-            Err(_) => {
-                chunk.unreadable = chunk.unreadable.saturating_add(1);
-                continue;
-            }
+    for entry in listing.entries {
+        let Some(meta) = entry.meta else {
+            chunk.note_unreadable();
+            continue;
         };
 
         match meta.kind {
             Kind::File => {
-                children.files.insert(name);
+                children.files.insert(entry.name);
             }
-            Kind::Directory => {
-                children.dirs.push((name, meta));
-            }
+            Kind::Directory => children.dirs.push((entry.name, meta)),
             Kind::Symlink | Kind::Other => {}
         }
     }
     Some(children)
 }
 
-fn consider_project_rules(
-    opts: &ScanOptions<'_>,
-    dir: &Path,
-    children: &Children,
-    chunk: &mut Chunk,
-) {
-    for rule in opts.project_rules {
-        let Some(marker) = matched_marker(rule, &children.files) else {
-            continue;
-        };
-        let Some((name, meta)) = children
-            .dirs
-            .iter()
-            .find(|(name, _)| name.as_os_str() == rule.child)
-        else {
-            continue;
-        };
-        if meta.is_dataless() {
-            continue;
-        }
-
-        let path = dir.join(name);
-        consider(
-            chunk,
-            opts,
-            Candidate {
-                rule: rule.id,
-                tier: Tier::Caution,
-                path: &path,
-                min_age: rule.min_age,
-                regenerate: Some(rule.regenerate),
-                rationale: rule.rationale,
-                marker: Some(dir.join(marker)),
-                project: Some(dir),
-                directory: true,
-            },
-        );
-    }
-}
-
-fn matched_marker(
-    rule: &ProjectRule,
-    files: &BTreeSet<std::ffi::OsString>,
-) -> Option<std::ffi::OsString> {
+fn matched_marker(rule: &ProjectRule, files: &BTreeSet<OsString>) -> Option<OsString> {
     for required in rule.require_all {
         if !files.contains(OsStr::new(required)) {
             return None;
@@ -518,17 +621,66 @@ fn matched_marker(
     }
 
     if rule.require_any.is_empty() {
-        return rule
-            .require_all
-            .first()
-            .copied()
-            .map(std::ffi::OsString::from);
+        return rule.require_all.first().copied().map(OsString::from);
     }
     rule.require_any
         .iter()
         .copied()
         .find(|name| files.contains(OsStr::new(name)))
-        .map(std::ffi::OsString::from)
+        .map(OsString::from)
+}
+
+/// Whether `child` holds one of the files the rule's tool writes there.
+fn written_by_tool(fs: &dyn Fs, child: &Path, rule: &ProjectRule) -> bool {
+    rule.inside_any.is_empty()
+        || rule
+            .inside_any
+            .iter()
+            .any(|name| is_file(fs, &child.join(name)))
+}
+
+fn is_file(fs: &dyn Fs, path: &Path) -> bool {
+    fs.meta(path).is_ok_and(|meta| meta.kind == Kind::File)
+}
+
+/// Paths where the rule's tool would hold a lock while writing `child`.
+///
+/// The names are tried one and two levels down. Cargo's build lock is at
+/// `target/debug/.cargo-lock` or, with `--target`, `target/<triple>/debug/.cargo-lock`.
+/// A path that does not exist costs one failed open when it is probed.
+fn project_locks(fs: &dyn Fs, child: &Path, rule: &ProjectRule) -> Vec<PathBuf> {
+    let mut locks = Vec::new();
+    if rule.locks.is_empty() {
+        return locks;
+    }
+
+    for first in subdirectories(fs, child) {
+        for name in rule.locks {
+            locks.push(first.join(name));
+        }
+        for second in subdirectories(fs, &first) {
+            for name in rule.locks {
+                locks.push(second.join(name));
+            }
+        }
+    }
+    locks
+}
+
+fn subdirectories(fs: &dyn Fs, dir: &Path) -> Vec<PathBuf> {
+    let Ok(listing) = fs.read_dir(dir) else {
+        return Vec::new();
+    };
+    listing
+        .entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .meta
+                .is_some_and(|meta| meta.kind == Kind::Directory && !meta.is_dataless())
+        })
+        .map(|entry| dir.join(entry.name))
+        .collect()
 }
 
 fn pruned(name: &OsStr) -> bool {
@@ -549,29 +701,104 @@ fn pruned(name: &OsStr) -> bool {
     NAMES.iter().any(|prune| OsStr::new(prune) == name)
 }
 
-struct Candidate<'a> {
+/// What a plan entry says about itself.
+pub(crate) struct Claim<'a> {
+    /// Rule id the entry names.
+    pub(crate) rule: &'a str,
+    /// Tier the entry names.
+    pub(crate) tier: Tier,
+    /// Path the entry asks to move.
+    pub(crate) path: &'a Path,
+    /// Marker the entry recorded, for a caution rule.
+    pub(crate) marker: Option<&'a Path>,
+}
+
+/// The rules a claim is checked against.
+pub(crate) struct RuleSet<'a> {
+    /// Home directory safe rules are resolved against.
+    pub(crate) home: &'a Path,
+    /// Safe rules.
+    pub(crate) safe: &'a [SafeRule],
+    /// Caution rules.
+    pub(crate) project: &'a [ProjectRule],
+}
+
+/// Checks that a rule could have produced `claim` on the disk as it is now.
+///
+/// Returns the tool lock files to probe, or `None` when no rule admits the
+/// path. A plan file is text anyone can write, with an id anyone can
+/// compute, so the plan is not the allowlist. The rule tables are.
+pub(crate) fn admit(fs: &dyn Fs, rules: &RuleSet<'_>, claim: &Claim<'_>) -> Option<Vec<PathBuf>> {
+    match claim.tier {
+        Tier::Safe => admit_safe(fs, rules, claim),
+        Tier::Caution => admit_caution(fs, rules, claim),
+    }
+}
+
+fn admit_safe(fs: &dyn Fs, rules: &RuleSet<'_>, claim: &Claim<'_>) -> Option<Vec<PathBuf>> {
+    let rule = rules.safe.iter().find(|rule| rule.id == claim.rule)?;
+    let named = match rule.anchor {
+        SafeAnchor::Directory(relative) => {
+            let anchor = fs.canonical(&rules.home.join(relative)).ok()?;
+            claim.path == anchor
+        }
+        SafeAnchor::Files(relative) => {
+            let anchor = fs.canonical(&rules.home.join(relative)).ok()?;
+            claim.path == anchor || claim.path.parent() == Some(anchor.as_path())
+        }
+    };
+    named.then(|| safe_locks(rules.home, rule))
+}
+
+fn admit_caution(fs: &dyn Fs, rules: &RuleSet<'_>, claim: &Claim<'_>) -> Option<Vec<PathBuf>> {
+    let rule = rules.project.iter().find(|rule| rule.id == claim.rule)?;
+    if claim.path.file_name()? != rule.child {
+        return None;
+    }
+    let project = claim.path.parent()?;
+    let marker = claim.marker?;
+    if marker.parent() != Some(project) {
+        return None;
+    }
+
+    let mut files = BTreeSet::new();
+    for name in rule.require_all.iter().chain(rule.require_any) {
+        if is_file(fs, &project.join(name)) {
+            files.insert(OsString::from(name));
+        }
+    }
+    matched_marker(rule, &files)?;
+    if !files.contains(marker.file_name()?) || !written_by_tool(fs, claim.path, rule) {
+        return None;
+    }
+    Some(project_locks(fs, claim.path, rule))
+}
+
+struct Candidate {
     rule: &'static str,
     tier: Tier,
-    path: &'a Path,
+    path: PathBuf,
     min_age: Duration,
     regenerate: Option<&'static str>,
     rationale: &'static str,
     marker: Option<PathBuf>,
-    project: Option<&'a Path>,
+    project: Option<PathBuf>,
     /// `true` when the rule named a directory. A file at that path is ignored.
     directory: bool,
+    /// Lock files of the tool that owns the path.
+    locks: Vec<PathBuf>,
 }
 
-fn consider(chunk: &mut Chunk, opts: &ScanOptions<'_>, candidate: Candidate<'_>) {
-    if path_is_denied(candidate.path, opts.deny) {
+fn consider(chunk: &mut Chunk, opts: &ScanOptions<'_>, git: &GitCache<'_>, candidate: &Candidate) {
+    if path_is_denied(&candidate.path, opts.deny) {
         return;
     }
 
-    let meta = match opts.fs.meta(candidate.path) {
+    let meta = match opts.fs.meta(&candidate.path) {
         Ok(meta) => meta,
         Err(err) if err.is_not_found() => return,
         Err(_) => {
-            chunk.unreadable = chunk.unreadable.saturating_add(1);
+            chunk.note_unreadable();
             return;
         }
     };
@@ -582,67 +809,60 @@ fn consider(chunk: &mut Chunk, opts: &ScanOptions<'_>, candidate: Candidate<'_>)
         return;
     }
 
-    consider_known(chunk, opts, candidate, &meta);
+    consider_known(chunk, opts, git, candidate, &meta);
 }
 
 fn consider_known(
     chunk: &mut Chunk,
     opts: &ScanOptions<'_>,
-    candidate: Candidate<'_>,
+    git: &GitCache<'_>,
+    candidate: &Candidate,
     meta: &EntryMeta,
 ) {
-    let measured = match measure(opts.fs, candidate.path, meta) {
+    let measured = match measure(opts.fs, &candidate.path, meta) {
         Ok(measured) => measured,
         Err(err) if err.is_not_found() => return,
         Err(_) => {
-            chunk.unreadable = chunk.unreadable.saturating_add(1);
+            chunk.note_unreadable();
             return;
         }
     };
     chunk.unreadable = chunk.unreadable.saturating_add(measured.unreadable);
 
-    let lock = match opts.fs.probe_lock(candidate.path) {
-        Ok(LockProbe::Free) => LockState::Free,
-        Ok(LockProbe::Held) => LockState::Held,
-        Err(err) if err.is_not_found() => return,
-        Err(_) => LockState::Unknown,
-    };
+    let lock = probe_locks(opts.fs, &candidate.path, &candidate.locks);
+    if lock == LockState::Gone {
+        return;
+    }
 
     // Age and lock first. `git status` is the expensive check, and a young or
     // locked tree is already not staged.
-    let mut skip = gate(&Gate {
+    let mut query = Gate {
         now: opts.now,
         tier: candidate.tier,
         min_age: candidate.min_age,
         measured: &measured,
         lock,
         git: None,
-    });
+    };
+    let mut skip = gate(&query);
     if skip.is_none()
-        && let Some(project) = candidate.project
+        && let Some(project) = &candidate.project
     {
-        let status = opts.git.status(project);
-        skip = gate(&Gate {
-            now: opts.now,
-            tier: candidate.tier,
-            min_age: candidate.min_age,
-            measured: &measured,
-            lock,
-            git: Some(status),
-        });
+        query.git = Some(git.status(project));
+        skip = gate(&query);
     }
 
     let finding = Finding {
         rule: candidate.rule,
         tier: candidate.tier,
-        path: candidate.path.to_path_buf(),
+        path: candidate.path.clone(),
         dev: meta.dev,
         ino: meta.ino,
         mtime: meta.mtime,
         newest: measured.newest,
         apparent_bytes: measured.apparent_bytes,
         regenerate: candidate.regenerate,
-        marker: candidate.marker,
+        marker: candidate.marker.clone(),
         skip,
         rationale: candidate.rationale,
     };
@@ -652,11 +872,38 @@ fn consider_known(
     chunk.findings.push(finding);
 }
 
-#[derive(Clone, Copy)]
-enum LockState {
+/// Whether anything holds the candidate or one of its tool's lock files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockState {
+    /// Nothing is held.
     Free,
+    /// Another process holds a lock.
     Held,
+    /// A probe failed, so the path might be in use.
     Unknown,
+    /// The candidate itself is gone.
+    Gone,
+}
+
+/// Probes `path` and then each of `locks`. A lock file that does not exist is free.
+pub(crate) fn probe_locks(fs: &dyn Fs, path: &Path, locks: &[PathBuf]) -> LockState {
+    match fs.probe_lock(path) {
+        Ok(LockProbe::Free) => {}
+        Ok(LockProbe::Held) => return LockState::Held,
+        Err(err) if err.is_not_found() => return LockState::Gone,
+        Err(_) => return LockState::Unknown,
+    }
+
+    let mut state = LockState::Free;
+    for lock in locks {
+        match fs.probe_lock(lock) {
+            Ok(LockProbe::Held) => return LockState::Held,
+            Ok(LockProbe::Free) => {}
+            Err(err) if err.is_not_found() => {}
+            Err(_) => state = LockState::Unknown,
+        }
+    }
+    state
 }
 
 struct Gate<'a> {
@@ -685,7 +932,7 @@ fn gate(query: &Gate<'_>) -> Option<Skip> {
     match query.lock {
         LockState::Held => return Some(Skip::Locked),
         LockState::Unknown => return Some(Skip::LockUnknown),
-        LockState::Free => {}
+        LockState::Free | LockState::Gone => {}
     }
 
     let Some(newest) = query.measured.newest else {

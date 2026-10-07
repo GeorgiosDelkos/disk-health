@@ -4,7 +4,13 @@
 //! copied and nothing is unlinked. `purge` is the only unlink, and it only
 //! unlinks a path whose canonical location is still inside a quarantine
 //! directory named in the action log.
+//!
+//! A plan is not trusted for what it names. Its id is a hash anyone can
+//! compute, so before a rename the entry has to be a path one of the rules
+//! given to [`apply`] produces on the disk as it is now, spelled canonically.
+//! The rename itself refuses to replace an existing destination.
 
+use std::collections::HashMap;
 use std::fs::{self, DirBuilder};
 use std::io::ErrorKind;
 use std::os::unix::fs::DirBuilderExt;
@@ -17,28 +23,72 @@ use crate::error::{Error, Result};
 use crate::log::{Action, ActionLog};
 use crate::plan::{Entry, Plan};
 use crate::report::format_bytes;
-use crate::rules::Tier;
+use crate::rules::{ProjectRule, SafeRule, Tier};
+use crate::scan::{Claim, LockState, RuleSet, admit, probe_locks};
 use crate::time::unix_nanos;
-use crate::walk::{Fs, Kind, LockProbe, measure};
+use crate::walk::{EntryMeta, Fs, Kind, measure};
 
 /// Renames `from` to `to`. The real implementation is [`FsRename`].
 pub trait Renamer {
-    /// `rename(2)`.
+    /// `rename(2)`, except that an existing `to` is an error and is left alone.
     ///
     /// # Errors
     ///
     /// Returns the system error. [`ErrorKind::CrossesDevices`] must not be
-    /// turned into a copy.
+    /// turned into a copy, and [`ErrorKind::AlreadyExists`] must not be
+    /// turned into a replace.
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
 }
 
-/// `std::fs::rename`.
+/// `renamex_np` with `RENAME_EXCL`.
+///
+/// Plain `rename` replaces a file at the destination. Checking first leaves
+/// a window, and what would be replaced is something already in the trash
+/// or, on restore, something written where the original used to be.
+///
+/// # Examples
+///
+/// ```
+/// use disk_health::trash::{FsRename, Renamer};
+///
+/// let dir = std::env::temp_dir().join(format!("disk-health-doc-excl-{}", std::process::id()));
+/// let _ = std::fs::remove_dir_all(&dir);
+/// std::fs::create_dir_all(&dir).unwrap();
+/// std::fs::write(dir.join("from"), b"new").unwrap();
+/// std::fs::write(dir.join("to"), b"kept").unwrap();
+///
+/// let err = FsRename.rename(&dir.join("from"), &dir.join("to")).unwrap_err();
+/// assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+/// assert_eq!(std::fs::read(dir.join("to")).unwrap(), b"kept");
+/// let _ = std::fs::remove_dir_all(&dir);
+/// ```
 #[derive(Debug, Default)]
 pub struct FsRename;
 
 impl Renamer for FsRename {
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-        fs::rename(from, to)
+        match sys::rename_exclusive(from, to) {
+            Err(source) if exclusive_unsupported(&source) => rename_after_check(from, to),
+            result => result,
+        }
+    }
+}
+
+/// `ENOTSUP` from the macOS SDK header `sys/errno.h`.
+fn exclusive_unsupported(source: &std::io::Error) -> bool {
+    source.kind() == ErrorKind::Unsupported || source.raw_os_error() == Some(45)
+}
+
+/// For a filesystem without `RENAME_EXCL`. The check and the rename are two
+/// calls, which is the window the exclusive rename closes where it exists.
+fn rename_after_check(from: &Path, to: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(to) {
+        Ok(_) => Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "rename destination exists",
+        )),
+        Err(source) if source.kind() == ErrorKind::NotFound => fs::rename(from, to),
+        Err(source) => Err(source),
     }
 }
 
@@ -56,6 +106,10 @@ pub struct ApplyRequest<'a> {
     pub uid: u32,
     /// Prefixes that are never moved, even if the plan names them.
     pub deny: &'a [PathBuf],
+    /// Safe rules. An entry is moved only when one of these names its path.
+    pub safe_rules: &'a [SafeRule],
+    /// Caution rules. An entry is moved only when its marker is still there.
+    pub project_rules: &'a [ProjectRule],
     /// `lstat` and the lock probe. Destination directories use the process filesystem.
     pub fs: &'a dyn Fs,
     /// Rename implementation.
@@ -132,6 +186,11 @@ pub enum SkipMove {
     Partial,
     /// The path is on the denylist or is not absolute.
     Denied,
+    /// The path is not canonical: it goes through a symlink, or is spelled
+    /// in a different case than the disk stores.
+    NotCanonical,
+    /// No rule produces this path, or its marker files are gone.
+    Rule,
     /// A caution entry has no marker.
     Marker,
     /// A file lock is held, or the probe failed.
@@ -176,6 +235,8 @@ impl std::fmt::Display for SkipMove {
             Self::Newer => formatter.write_str("a child is newer than the scan"),
             Self::Partial => formatter.write_str("tree could not be reread"),
             Self::Denied => formatter.write_str("path is denied"),
+            Self::NotCanonical => formatter.write_str("path is not canonical"),
+            Self::Rule => formatter.write_str("no rule names this path"),
             Self::Marker => formatter.write_str("caution entry has no marker"),
             Self::Locked => formatter.write_str("path is locked"),
             Self::Exdev => formatter.write_str("rename crossed devices"),
@@ -213,6 +274,8 @@ impl std::fmt::Display for SkipMove {
 ///     home_dev: 1,
 ///     uid: 0,
 ///     deny: &[],
+///     safe_rules: &[],
+///     project_rules: &[],
 ///     fs: &fs,
 ///     renamer: &renamer,
 ///     log: &mut log,
@@ -264,6 +327,8 @@ pub fn apply(mut request: ApplyRequest<'_>) -> Result<ApplyReport> {
 ///         home_dev: 1,
 ///         uid: 0,
 ///         deny: &[],
+///         safe_rules: &[],
+///         project_rules: &[],
 ///         fs: &fs,
 ///         renamer: &renamer,
 ///         log: &mut log,
@@ -312,7 +377,7 @@ fn stage_one(
     entry: &Entry,
     index: usize,
 ) -> std::result::Result<Moved, SkipMove> {
-    if let Some(reason) = revalidate(entry, request.fs, request.deny) {
+    if let Some(reason) = revalidate(request, entry) {
         return Err(reason);
     }
 
@@ -320,8 +385,9 @@ fn stage_one(
     rename_and_log(request, entry, &dest)
 }
 
-fn revalidate(entry: &Entry, fs: &dyn Fs, deny: &[PathBuf]) -> Option<SkipMove> {
-    if !entry.path.is_absolute() || path_is_denied(&entry.path, deny) {
+fn revalidate(request: &ApplyRequest<'_>, entry: &Entry) -> Option<SkipMove> {
+    let fs = request.fs;
+    if !entry.path.is_absolute() || path_is_denied(&entry.path, request.deny) {
         return Some(SkipMove::Denied);
     }
     if entry.tier == Tier::Caution && entry.marker.is_none() {
@@ -333,6 +399,25 @@ fn revalidate(entry: &Entry, fs: &dyn Fs, deny: &[PathBuf]) -> Option<SkipMove> 
         Err(err) if err.is_not_found() => return Some(SkipMove::Missing),
         Err(_) => return Some(SkipMove::Partial),
     };
+    if let Some(reason) = wrong_object(entry, &meta) {
+        return Some(reason);
+    }
+    let locks = match admitted(request, entry) {
+        Ok(locks) => locks,
+        Err(reason) => return Some(reason),
+    };
+
+    if probe_locks(fs, &entry.path, &locks) != LockState::Free {
+        return Some(SkipMove::Locked);
+    }
+    if meta.kind == Kind::Directory {
+        return directory_still_cold(fs, entry, &meta);
+    }
+    None
+}
+
+/// The path now holds something other than what the scan recorded.
+fn wrong_object(entry: &Entry, meta: &EntryMeta) -> Option<SkipMove> {
     if meta.kind == Kind::Symlink {
         return Some(SkipMove::Symlink);
     }
@@ -350,24 +435,39 @@ fn revalidate(entry: &Entry, fs: &dyn Fs, deny: &[PathBuf]) -> Option<SkipMove> 
     if fresh.is_none() || fresh != entry.mtime_ns {
         return Some(SkipMove::Identity);
     }
-    if !lock_free(fs, &entry.path) {
-        return Some(SkipMove::Locked);
-    }
-    if meta.kind == Kind::Directory {
-        return directory_still_cold(fs, entry, &meta);
-    }
     None
 }
 
-fn lock_free(fs: &dyn Fs, path: &Path) -> bool {
-    matches!(fs.probe_lock(path), Ok(LockProbe::Free))
+/// The tool lock files to probe, once the path is canonical and a rule names it.
+///
+/// The denylist was compared against the path as written. That only means
+/// something when the path is the canonical one, so `~/link/keys` and
+/// `~/.SSH` stop here.
+fn admitted(
+    request: &ApplyRequest<'_>,
+    entry: &Entry,
+) -> std::result::Result<Vec<PathBuf>, SkipMove> {
+    match request.fs.canonical(&entry.path) {
+        Ok(canonical) if canonical == entry.path => {}
+        Ok(_) => return Err(SkipMove::NotCanonical),
+        Err(_) => return Err(SkipMove::Partial),
+    }
+
+    let rules = RuleSet {
+        home: request.home,
+        safe: request.safe_rules,
+        project: request.project_rules,
+    };
+    let claim = Claim {
+        rule: &entry.rule,
+        tier: entry.tier,
+        path: &entry.path,
+        marker: entry.marker.as_deref(),
+    };
+    admit(request.fs, &rules, &claim).ok_or(SkipMove::Rule)
 }
 
-fn directory_still_cold(
-    fs: &dyn Fs,
-    entry: &Entry,
-    meta: &crate::walk::EntryMeta,
-) -> Option<SkipMove> {
+fn directory_still_cold(fs: &dyn Fs, entry: &Entry, meta: &EntryMeta) -> Option<SkipMove> {
     let Ok(measured) = measure(fs, &entry.path, meta) else {
         return Some(SkipMove::Partial);
     };
@@ -672,7 +772,8 @@ pub struct PurgeReport {
 /// Unlinks quarantine entries older than 7 days.
 ///
 /// Platform trash is not touched. A row whose canonical path is outside the
-/// quarantine directory named in that row is ignored.
+/// quarantine directory named in that row is ignored, and so is every row
+/// but the last for a destination.
 ///
 /// # Errors
 ///
@@ -691,9 +792,22 @@ pub struct PurgeReport {
 /// assert!(report.removed.is_empty());
 /// ```
 pub fn purge(request: &PurgeRequest<'_>) -> Result<PurgeReport> {
+    let actions = request.log.load()?;
+    // A path can be quarantined, restored, and quarantined again at the same
+    // destination. Only the last move says how long it has been there.
+    let latest: HashMap<&Path, usize> = actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| (action.to.as_path(), index))
+        .collect();
+
     let mut removed = Vec::new();
     let mut ignored = 0;
-    for action in request.log.load()? {
+    for (index, action) in actions.iter().enumerate() {
+        if latest.get(action.to.as_path()) != Some(&index) {
+            ignored += 1;
+            continue;
+        }
         if !old_enough(action.at, request.now) {
             ignored += 1;
             continue;
@@ -788,5 +902,49 @@ fn unlink_inside(path: &Path) -> Result<()> {
         Err(Error::Plan {
             message: "quarantine entry is not a file or directory".to_owned(),
         })
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod sys {
+    #![allow(unsafe_code, reason = "renamex_np from the system headers")]
+
+    use std::ffi::{CString, c_char, c_int, c_uint};
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// `RENAME_EXCL` from the macOS SDK header `sys/stdio.h`.
+    const RENAME_EXCL: c_uint = 0x0000_0004;
+
+    unsafe extern "C" {
+        /// `int renamex_np(const char *, const char *, unsigned int)` from `stdio.h`.
+        fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
+    }
+
+    pub(super) fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+        let from = CString::new(from.as_os_str().as_bytes())?;
+        let to = CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: both pointers are NUL-terminated strings owned by this
+        // frame for the whole call, and `renamex_np` does not retain them.
+        let rc = unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_EXCL) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod sys {
+    use std::io;
+    use std::path::Path;
+
+    pub(super) fn rename_exclusive(_from: &Path, _to: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "disk-health runs on macOS",
+        ))
     }
 }

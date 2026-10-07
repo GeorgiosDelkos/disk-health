@@ -811,7 +811,7 @@ fn drive(session: &Session<'_>) -> crate::Result<i32> {
         let Some(key) = decode(&bytes) else {
             continue;
         };
-        if apply_key(&mut model, session, &loaded.deny, key)? {
+        if apply_key(&mut model, session, &loaded, key)? {
             break;
         }
     }
@@ -851,14 +851,19 @@ fn drain(
 fn apply_key(
     model: &mut Model,
     session: &Session<'_>,
-    deny: &[PathBuf],
+    loaded: &crate::config::Loaded,
     key: Key,
 ) -> crate::Result<bool> {
     match model.handle(key) {
         Effect::Quit => Ok(true),
         Effect::None => Ok(false),
         Effect::WalkUsage { mount } => {
-            match crate::usage::walk(&crate::walk::RealFs, &mount, crate::usage::DEFAULT_DEPTH) {
+            match crate::usage::walk(
+                &crate::walk::RealFs,
+                &mount,
+                crate::usage::DEFAULT_DEPTH,
+                None,
+            ) {
                 Ok(tree) => model.set_usage(tree),
                 Err(err) => model.set_message(err.to_string()),
             }
@@ -866,7 +871,7 @@ fn apply_key(
         }
         Effect::ConfirmApply { typed } => {
             // Typed size, not the plan id. `apply` would reject this path.
-            confirm(model, session, deny, &typed)?;
+            confirm(model, session, loaded, &typed)?;
             Ok(false)
         }
     }
@@ -875,7 +880,7 @@ fn apply_key(
 fn confirm(
     model: &mut Model,
     session: &Session<'_>,
-    deny: &[PathBuf],
+    loaded: &crate::config::Loaded,
     typed: &str,
 ) -> crate::Result<()> {
     let plan = model.plan(&hostname());
@@ -890,7 +895,9 @@ fn confirm(
             home: session.home,
             home_dev: home_meta.dev,
             uid: crate::volumes::current_uid(),
-            deny,
+            deny: &loaded.deny,
+            safe_rules: &loaded.safe_rules,
+            project_rules: &loaded.project_rules,
             fs: &filesystem,
             renamer: &renamer,
             log: &mut log,
@@ -1945,6 +1952,7 @@ mod tests {
             total_bytes: 100,
             used_bytes: 40,
             available_bytes: 60,
+            dev: 1,
             walkable,
             note: None,
         }

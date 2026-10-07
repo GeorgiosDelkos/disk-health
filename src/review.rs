@@ -10,12 +10,15 @@
 //! `pnpm` and `rustup` are advice text. Nothing here execs them.
 
 use std::ffi::OsString;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::git::{WorktreeGit, WorktreeStatus};
 use crate::json;
-use crate::walk::{Fs, Kind, measure};
+use crate::walk::{Fs, Kind, measure_children};
 
 /// Why the row is inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,12 +225,88 @@ pub fn inventory(
     git: &dyn WorktreeGit,
     rustup_settings: Option<&str>,
 ) -> Vec<Item> {
-    let mut items = Vec::new();
-    fixed_rows(&mut items, fs, home, now);
-    worktree_rows(&mut items, fs, home, now, git);
-    toolchain_rows(&mut items, fs, home, now, rustup_settings);
+    let mut rows = FIXED
+        .iter()
+        .map(|fixed| Row::Fixed(home.join(fixed.relative), fixed))
+        .collect::<Vec<_>>();
+    worktree_rows(&mut rows, fs, home);
+    toolchain_rows(&mut rows, fs, home, rustup_settings);
+
+    let mut items = measure_rows(&rows, &Sizing { fs, now, git });
     items.sort_by(|left, right| left.path.cmp(&right.path));
     items
+}
+
+/// A row that still has to be sized. Finding the rows is a few listings;
+/// sizing one is a walk of everything under it.
+enum Row {
+    Fixed(PathBuf, &'static Fixed),
+    Worktree(PathBuf),
+    Toolchain {
+        path: PathBuf,
+        name: String,
+        active: bool,
+    },
+}
+
+struct Sizing<'a> {
+    fs: &'a dyn Fs,
+    now: SystemTime,
+    git: &'a dyn WorktreeGit,
+}
+
+/// Most rows sized at once. The work is waiting on directory reads.
+const MAX_SIZERS: usize = 8;
+
+/// Sizes the rows on a few threads. Each takes the next unsized row.
+fn measure_rows(rows: &[Row], sizing: &Sizing<'_>) -> Vec<Item> {
+    let next = AtomicUsize::new(0);
+    let take = || {
+        let mut items = Vec::new();
+        // `Relaxed`: the counter only hands out indexes. Nothing else is
+        // published through it.
+        while let Some(row) = rows.get(next.fetch_add(1, Ordering::Relaxed)) {
+            items.extend(row.item(sizing));
+        }
+        items
+    };
+
+    let sizers = thread::available_parallelism()
+        .map_or(1, NonZero::get)
+        .min(MAX_SIZERS)
+        .min(rows.len());
+    thread::scope(|scope| {
+        let handles = (1..sizers)
+            .filter_map(|_| thread::Builder::new().spawn_scoped(scope, take).ok())
+            .collect::<Vec<_>>();
+        // This thread works too, so a refused spawn only makes the rest slower.
+        let mut items = take();
+        for handle in handles {
+            items.extend(handle.join().expect("review sizing panicked"));
+        }
+        items
+    })
+}
+
+impl Row {
+    fn item(&self, sizing: &Sizing<'_>) -> Option<Item> {
+        match self {
+            Self::Fixed(path, fixed) => {
+                let size = size_of(sizing.fs, path, sizing.now)?;
+                Some(fixed_item(path, size, fixed))
+            }
+            Self::Worktree(path) => {
+                let (size, caution_child_bytes) =
+                    size_with(sizing.fs, path, sizing.now, CAUTION_CHILDREN)?;
+                let status = sizing.git.inspect(path);
+                Some(worktree_item(path, size, caution_child_bytes, status))
+            }
+            Self::Toolchain { path, name, active } => {
+                let size = size_of(sizing.fs, path, sizing.now)?;
+                Some(toolchain_item(path, size, name, *active))
+            }
+        }
+    }
 }
 
 /// Appends review objects. The caller writes the surrounding array.
@@ -273,42 +352,30 @@ pub fn append_json(out: &mut String, items: &[Item]) {
     }
 }
 
-fn fixed_rows(items: &mut Vec<Item>, fs: &dyn Fs, home: &Path, now: SystemTime) {
-    for fixed in FIXED {
-        let path = home.join(fixed.relative);
-        let Some(size) = size_of(fs, &path, now) else {
-            continue;
-        };
-        items.push(Item {
-            class: fixed.class,
-            path,
-            apparent_bytes: size.bytes,
-            caution_child_bytes: 0,
-            age: size.age,
-            branch: None,
-            dirty: None,
-            upstream: None,
-            ahead: None,
-            behind: None,
-            advice: fixed.advice.map(str::to_owned),
-            active: false,
-            note: fixed.note,
-        });
+fn fixed_item(path: &Path, size: Size, fixed: &Fixed) -> Item {
+    Item {
+        class: fixed.class,
+        path: path.to_path_buf(),
+        apparent_bytes: size.bytes,
+        caution_child_bytes: 0,
+        age: size.age,
+        branch: None,
+        dirty: None,
+        upstream: None,
+        ahead: None,
+        behind: None,
+        advice: fixed.advice.map(str::to_owned),
+        active: false,
+        note: fixed.note,
     }
 }
 
-fn worktree_rows(
-    items: &mut Vec<Item>,
-    fs: &dyn Fs,
-    home: &Path,
-    now: SystemTime,
-    git: &dyn WorktreeGit,
-) {
+fn worktree_rows(rows: &mut Vec<Row>, fs: &dyn Fs, home: &Path) {
     let root = home.join(".grok/worktrees");
     for name in sorted_names(fs, &root) {
         let child = root.join(&name);
         if is_checkout(fs, &child) {
-            push_worktree(items, fs, &child, now, git);
+            rows.push(Row::Worktree(child));
             continue;
         }
         if !is_directory(fs, &child) {
@@ -317,24 +384,10 @@ fn worktree_rows(
         for nested in sorted_names(fs, &child) {
             let checkout = child.join(&nested);
             if is_checkout(fs, &checkout) {
-                push_worktree(items, fs, &checkout, now, git);
+                rows.push(Row::Worktree(checkout));
             }
         }
     }
-}
-
-fn push_worktree(
-    items: &mut Vec<Item>,
-    fs: &dyn Fs,
-    path: &Path,
-    now: SystemTime,
-    git: &dyn WorktreeGit,
-) {
-    let Some(size) = size_of(fs, path, now) else {
-        return;
-    };
-    let status = git.inspect(path);
-    items.push(worktree_item(path, size, caution_bytes(fs, path), status));
 }
 
 fn worktree_item(
@@ -360,26 +413,17 @@ fn worktree_item(
     }
 }
 
-fn toolchain_rows(
-    items: &mut Vec<Item>,
-    fs: &dyn Fs,
-    home: &Path,
-    now: SystemTime,
-    settings: Option<&str>,
-) {
+fn toolchain_rows(rows: &mut Vec<Row>, fs: &dyn Fs, home: &Path, settings: Option<&str>) {
     let root = home.join(".rustup/toolchains");
-    let active = settings.and_then(default_toolchain);
+    let default = settings.and_then(default_toolchain);
     for name in sorted_names(fs, &root) {
         let path = root.join(&name);
         if !is_directory(fs, &path) {
             continue;
         }
-        let Some(size) = size_of(fs, &path, now) else {
-            continue;
-        };
-        let label = name.to_string_lossy();
-        let marked = active.as_deref() == Some(label.as_ref());
-        items.push(toolchain_item(&path, size, &label, marked));
+        let name = name.to_string_lossy().into_owned();
+        let active = default.as_deref() == Some(name.as_str());
+        rows.push(Row::Toolchain { path, name, active });
     }
 }
 
@@ -412,37 +456,30 @@ struct Size {
     age: Option<Duration>,
 }
 
+/// Build output a worktree row reports separately from its own size.
+const CAUTION_CHILDREN: &[&str] = &["target", "node_modules"];
+
 fn size_of(fs: &dyn Fs, path: &Path, now: SystemTime) -> Option<Size> {
+    size_with(fs, path, now, &[]).map(|(size, _)| size)
+}
+
+/// Size of `path`, and of its direct children in `named`, from one walk.
+fn size_with(fs: &dyn Fs, path: &Path, now: SystemTime, named: &[&str]) -> Option<(Size, u64)> {
     let meta = fs.meta(path).ok()?;
     if meta.is_dataless() {
         return None;
     }
-    let bytes = match meta.kind {
-        Kind::File => meta.len,
-        Kind::Directory => measure(fs, path, &meta).map_or(0, |measured| measured.apparent_bytes),
+    let (bytes, named_bytes) = match meta.kind {
+        Kind::File => (meta.len, 0),
+        Kind::Directory => measure_children(fs, path, &meta, named)
+            .map_or((0, 0), |(measured, named)| (measured.apparent_bytes, named)),
         Kind::Symlink | Kind::Other => return None,
     };
-    Some(Size {
+    let size = Size {
         bytes,
         age: age_of(now, meta.mtime),
-    })
-}
-
-fn caution_bytes(fs: &dyn Fs, checkout: &Path) -> u64 {
-    let mut sum: u64 = 0;
-    for name in ["target", "node_modules"] {
-        let path = checkout.join(name);
-        let Ok(meta) = fs.meta(&path) else {
-            continue;
-        };
-        if meta.kind != Kind::Directory || meta.is_dataless() {
-            continue;
-        }
-        if let Ok(measured) = measure(fs, &path, &meta) {
-            sum = sum.saturating_add(measured.apparent_bytes);
-        }
-    }
-    sum
+    };
+    Some((size, named_bytes))
 }
 
 fn is_checkout(fs: &dyn Fs, path: &Path) -> bool {
@@ -460,7 +497,14 @@ fn is_directory(fs: &dyn Fs, path: &Path) -> bool {
 }
 
 fn sorted_names(fs: &dyn Fs, path: &Path) -> Vec<OsString> {
-    let mut names = fs.read_dir(path).unwrap_or_default();
+    let Ok(listing) = fs.read_dir(path) else {
+        return Vec::new();
+    };
+    let mut names = listing
+        .entries
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
     names.sort();
     names
 }

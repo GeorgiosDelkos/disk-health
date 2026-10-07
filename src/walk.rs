@@ -1,16 +1,27 @@
 //! Filesystem reads that do not follow symlinks.
 //!
-//! [`RealFs`] uses `symlink_metadata` (lstat). A symlink is [`Kind::Symlink`]
-//! and is never opened. That is the difference between reporting a
-//! `node_modules` link and sizing the directory it points at.
+//! [`RealFs`] uses `symlink_metadata` (lstat) for a single path. A symlink is
+//! [`Kind::Symlink`] and is never opened. That is the difference between
+//! reporting a `node_modules` link and sizing the directory it points at.
+//!
+//! A directory is listed with `getattrlistbulk`, which returns each child's
+//! attributes in the same call. One `lstat` per file was 98% of the wall time
+//! of a scan. Two things keep the bulk listing as strict as `lstat` was:
+//!
+//! - The directory is opened with `O_NOFOLLOW`, so a symlink swapped in after
+//!   the parent was listed is an error and not a walk of its target.
+//! - [`Listing::dev`] is the device of the directory that was opened. A bulk
+//!   listing describes a mount point as the directory underneath it, so the
+//!   walk compares this device and does not trust the child's own.
 //!
 //! [`MemFs`] is the in-memory double the safety tests drive. It is public
 //! because those tests live outside this crate. It is not a scan root.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs::File;
-use std::fs::TryLockError;
+use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -22,6 +33,11 @@ use crate::error::{Error, Result};
 /// A dataless directory is an iCloud placeholder. Listing it can download the
 /// contents, so the walk does not enter one.
 pub const SF_DATALESS: u32 = 0x4000_0000;
+
+/// `O_NOFOLLOW` from the macOS SDK header `sys/fcntl.h`.
+const O_NOFOLLOW: i32 = 0x0100;
+/// `O_DIRECTORY` from the macOS SDK header `sys/fcntl.h`.
+const O_DIRECTORY: i32 = 0x0010_0000;
 
 /// What `lstat` reported. Sockets and devices are [`Kind::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +63,8 @@ pub struct EntryMeta {
     pub ino: u64,
     /// `st_size` for a regular file. Directory sizes are not added up.
     pub len: u64,
+    /// `st_nlink` for a regular file. A listing reports 1 for everything else.
+    pub nlink: u64,
     /// `mtime`. `None` when the system did not provide one.
     pub mtime: Option<SystemTime>,
     /// `st_flags`, including [`SF_DATALESS`].
@@ -67,6 +85,7 @@ impl EntryMeta {
     ///     dev: 1,
     ///     ino: 1,
     ///     len: 0,
+    ///     nlink: 1,
     ///     mtime: Some(SystemTime::UNIX_EPOCH),
     ///     flags: SF_DATALESS,
     /// };
@@ -76,6 +95,27 @@ impl EntryMeta {
     pub const fn is_dataless(self) -> bool {
         self.flags & SF_DATALESS != 0
     }
+}
+
+/// One name in a directory, with the attributes read alongside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    /// File name, without the directory.
+    pub name: OsString,
+    /// Attributes of the name itself. `None` when they could not be read.
+    pub meta: Option<EntryMeta>,
+}
+
+/// The children of one directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// Device of the directory that was opened.
+    ///
+    /// This is the mounted filesystem when the path is a mount point, even
+    /// though the parent's listing reported the directory underneath.
+    pub dev: u64,
+    /// Children in the order the filesystem returned them.
+    pub entries: Vec<Listed>,
 }
 
 /// Result of a non-blocking exclusive lock probe.
@@ -109,11 +149,12 @@ pub trait Fs: Sync {
     /// ```
     fn meta(&self, path: &Path) -> Result<EntryMeta>;
 
-    /// Names in a directory. Each name is stated separately with [`Fs::meta`].
+    /// Children of a directory, each with its own attributes.
     ///
     /// # Errors
     ///
-    /// Returns an error when the directory cannot be listed.
+    /// Returns an error when the directory cannot be listed, or when `path`
+    /// is a symlink.
     ///
     /// # Examples
     ///
@@ -126,10 +167,11 @@ pub trait Fs: Sync {
     /// let when = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
     /// fs.dir("/cache", 1, when);
     /// fs.file("/cache/blob", 1, 4, when);
-    /// let names = fs.read_dir(Path::new("/cache")).unwrap();
-    /// assert_eq!(names, [std::ffi::OsString::from("blob")]);
+    /// let listing = fs.read_dir(Path::new("/cache")).unwrap();
+    /// assert_eq!(listing.entries[0].name, "blob");
+    /// assert_eq!(listing.entries[0].meta.unwrap().len, 4);
     /// ```
-    fn read_dir(&self, path: &Path) -> Result<Vec<std::ffi::OsString>>;
+    fn read_dir(&self, path: &Path) -> Result<Listing>;
 
     /// Tries an exclusive non-blocking lock and releases it.
     ///
@@ -155,6 +197,28 @@ pub trait Fs: Sync {
     /// assert_eq!(fs.probe_lock(Path::new("/cache")).unwrap(), LockProbe::Held);
     /// ```
     fn probe_lock(&self, path: &Path) -> Result<LockProbe>;
+
+    /// The path with every symlink resolved and every name in its stored case.
+    ///
+    /// The denylist is compared against paths as text. A path that reaches a
+    /// denied directory through a symlink only matches after this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path does not exist or cannot be resolved.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use disk_health::walk::{Fs, MemFs};
+    /// use std::path::Path;
+    /// use std::time::SystemTime;
+    ///
+    /// let fs = MemFs::new();
+    /// fs.dir("/cache", 1, SystemTime::UNIX_EPOCH);
+    /// assert_eq!(fs.canonical(Path::new("/cache")).unwrap(), Path::new("/cache"));
+    /// ```
+    fn canonical(&self, path: &Path) -> Result<PathBuf>;
 }
 
 /// The process filesystem.
@@ -170,15 +234,24 @@ impl Fs for RealFs {
         Ok(entry_from(&meta))
     }
 
-    fn read_dir(&self, path: &Path) -> Result<Vec<std::ffi::OsString>> {
-        let entries =
-            std::fs::read_dir(path).map_err(|source| Error::io("read directory", path, source))?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| Error::io("read directory", path, source))?;
-            names.push(entry.file_name());
-        }
-        Ok(names)
+    fn read_dir(&self, path: &Path) -> Result<Listing> {
+        use std::os::darwin::fs::MetadataExt;
+
+        let failed = |source| Error::io("read directory", path, source);
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+            .open(path)
+            .map_err(failed)?;
+        let dev = dir.metadata().map_err(failed)?.st_dev();
+
+        let entries = match sys::list_bulk(&dir) {
+            Ok(entries) => entries,
+            // Not every filesystem implements the bulk call. `lstat` works on all of them.
+            Err(source) if bulk_unsupported(&source) => list_by_stat(path).map_err(failed)?,
+            Err(source) => return Err(failed(source)),
+        };
+        Ok(Listing { dev, entries })
     }
 
     fn probe_lock(&self, path: &Path) -> Result<LockProbe> {
@@ -195,6 +268,10 @@ impl Fs for RealFs {
             Err(TryLockError::WouldBlock) => Ok(LockProbe::Held),
             Err(TryLockError::Error(source)) => Err(Error::io("lock probe", path, source)),
         }
+    }
+
+    fn canonical(&self, path: &Path) -> Result<PathBuf> {
+        std::fs::canonicalize(path).map_err(|source| Error::io("resolve", path, source))
     }
 }
 
@@ -215,8 +292,320 @@ fn entry_from(meta: &std::fs::Metadata) -> EntryMeta {
         dev: meta.st_dev(),
         ino: meta.st_ino(),
         len: meta.len(),
+        nlink: meta.st_nlink(),
         mtime: meta.modified().ok(),
         flags: meta.st_flags(),
+    }
+}
+
+/// `ENOTSUP` and `EOPNOTSUPP` from the macOS SDK header `sys/errno.h`.
+fn bulk_unsupported(source: &std::io::Error) -> bool {
+    source.kind() == ErrorKind::Unsupported || matches!(source.raw_os_error(), Some(45 | 102))
+}
+
+/// One `lstat` per name, for a filesystem without the bulk call.
+fn list_by_stat(path: &Path) -> std::io::Result<Vec<Listed>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let meta = match std::fs::symlink_metadata(entry.path()) {
+            Ok(meta) => Some(entry_from(&meta)),
+            // Removed between the listing and the stat. It is not a child any more.
+            Err(source) if source.kind() == ErrorKind::NotFound => continue,
+            Err(_) => None,
+        };
+        entries.push(Listed {
+            name: entry.file_name(),
+            meta,
+        });
+    }
+    Ok(entries)
+}
+
+/// Decodes `getattrlistbulk` records. The layout is in `man 2 getattrlistbulk`.
+///
+/// Every field is copied out with `from_ne_bytes` after a bounds check, so a
+/// record this code does not understand is an error and not a wrong size.
+mod bulk {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::time::{Duration, SystemTime};
+
+    use super::{EntryMeta, Kind, Listed};
+
+    /// `ATTR_BIT_MAP_COUNT` from `sys/attr.h`.
+    pub(super) const BIT_MAP_COUNT: u16 = 5;
+
+    const CMN_NAME: u32 = 0x0000_0001;
+    const CMN_DEVID: u32 = 0x0000_0002;
+    const CMN_OBJTYPE: u32 = 0x0000_0008;
+    const CMN_MODTIME: u32 = 0x0000_0400;
+    const CMN_FLAGS: u32 = 0x0004_0000;
+    const CMN_FILEID: u32 = 0x0200_0000;
+    const CMN_ERROR: u32 = 0x2000_0000;
+    const CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+    const FILE_LINKCOUNT: u32 = 0x0000_0001;
+    const FILE_DATALENGTH: u32 = 0x0000_0200;
+
+    /// `commonattr` bits this module asks for and knows how to skip over.
+    pub(super) const COMMON: u32 = CMN_RETURNED_ATTRS
+        | CMN_ERROR
+        | CMN_NAME
+        | CMN_DEVID
+        | CMN_OBJTYPE
+        | CMN_MODTIME
+        | CMN_FLAGS
+        | CMN_FILEID;
+    /// `fileattr` bits this module asks for.
+    pub(super) const FILE: u32 = FILE_LINKCOUNT | FILE_DATALENGTH;
+
+    /// `enum vtype` from `sys/vnode.h`.
+    const VREG: u32 = 1;
+    const VDIR: u32 = 2;
+    const VLNK: u32 = 5;
+
+    /// Reads `count` records from the front of `buf`.
+    ///
+    /// `None` means a record ran past the buffer or carried an attribute
+    /// that was not requested.
+    pub(super) fn decode(buf: &[u8], count: usize, out: &mut Vec<Listed>) -> Option<()> {
+        let mut rest = buf;
+        for _ in 0..count {
+            let length = usize::try_from(Cursor::new(rest).u32()?).ok()?;
+            let record = rest.get(..length)?;
+            rest = rest.get(length..)?;
+
+            let listed = record_entry(record)?;
+            if listed.name != "." && listed.name != ".." {
+                out.push(listed);
+            }
+        }
+        Some(())
+    }
+
+    fn record_entry(record: &[u8]) -> Option<Listed> {
+        let mut cursor = Cursor::new(record);
+        cursor.u32()?;
+        let common = cursor.u32()?;
+        // volattr and dirattr were not requested. forkattr follows fileattr.
+        cursor.u32()?;
+        cursor.u32()?;
+        let file = cursor.u32()?;
+        cursor.u32()?;
+        if common & !COMMON != 0 || file & !FILE != 0 {
+            return None;
+        }
+
+        let error = if common & CMN_ERROR == 0 {
+            0
+        } else {
+            cursor.u32()?
+        };
+        if common & CMN_NAME == 0 {
+            return None;
+        }
+        let name = cursor.name()?;
+        if error != 0 {
+            return Some(Listed { name, meta: None });
+        }
+
+        let meta = record_meta(&mut cursor, common, file);
+        Some(Listed { name, meta })
+    }
+
+    /// `None` leaves the name listed and unreadable, which the walk counts.
+    fn record_meta(cursor: &mut Cursor<'_>, common: u32, file: u32) -> Option<EntryMeta> {
+        let required = CMN_DEVID | CMN_OBJTYPE | CMN_FLAGS | CMN_FILEID;
+        if common & required != required {
+            return None;
+        }
+
+        let dev = u64::from(cursor.u32()?);
+        let kind = match cursor.u32()? {
+            VREG => Kind::File,
+            VDIR => Kind::Directory,
+            VLNK => Kind::Symlink,
+            _ => Kind::Other,
+        };
+        let mtime = if common & CMN_MODTIME == 0 {
+            None
+        } else {
+            timespec(cursor.i64()?, cursor.i64()?)
+        };
+        let flags = cursor.u32()?;
+        let ino = cursor.u64()?;
+
+        let nlink = if file & FILE_LINKCOUNT == 0 {
+            1
+        } else {
+            u64::from(cursor.u32()?)
+        };
+        let len = if file & FILE_DATALENGTH == 0 {
+            // A regular file without a length cannot be sized.
+            if kind == Kind::File {
+                return None;
+            }
+            0
+        } else {
+            u64::try_from(cursor.i64()?).ok()?
+        };
+
+        Some(EntryMeta {
+            kind,
+            dev,
+            ino,
+            len,
+            nlink,
+            mtime,
+            flags,
+        })
+    }
+
+    fn timespec(seconds: i64, nanos: i64) -> Option<SystemTime> {
+        let nanos = u32::try_from(nanos).ok()?;
+        let seconds = u64::try_from(seconds).ok()?;
+        SystemTime::UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
+    }
+
+    struct Cursor<'a> {
+        record: &'a [u8],
+        at: usize,
+    }
+
+    impl<'a> Cursor<'a> {
+        const fn new(record: &'a [u8]) -> Self {
+            Self { record, at: 0 }
+        }
+
+        fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+            let end = self.at.checked_add(N)?;
+            let bytes = self.record.get(self.at..end)?.try_into().ok()?;
+            self.at = end;
+            Some(bytes)
+        }
+
+        fn u32(&mut self) -> Option<u32> {
+            self.take().map(u32::from_ne_bytes)
+        }
+
+        fn u64(&mut self) -> Option<u64> {
+            self.take().map(u64::from_ne_bytes)
+        }
+
+        fn i64(&mut self) -> Option<i64> {
+            self.take().map(i64::from_ne_bytes)
+        }
+
+        /// An `attrreference_t`: a signed offset from its own first byte, and
+        /// a length that counts the trailing NUL.
+        fn name(&mut self) -> Option<OsString> {
+            let base = self.at;
+            let offset = i32::from_ne_bytes(self.take()?);
+            let length = usize::try_from(self.u32()?).ok()?;
+
+            let start = base.checked_add(usize::try_from(offset).ok()?)?;
+            let end = start.checked_add(length.checked_sub(1)?)?;
+            let bytes = self.record.get(start..end)?;
+            Some(OsString::from_vec(bytes.to_vec()))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod sys {
+    #![allow(unsafe_code, reason = "getattrlistbulk from the system headers")]
+
+    use std::ffi::{c_int, c_void};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::AsRawFd;
+
+    use super::{Listed, bulk};
+
+    /// `struct attrlist` from `sys/attr.h`.
+    #[repr(C)]
+    struct AttrList {
+        bitmapcount: u16,
+        reserved: u16,
+        commonattr: u32,
+        volattr: u32,
+        dirattr: u32,
+        fileattr: u32,
+        forkattr: u32,
+    }
+
+    /// Room for a few hundred children per call.
+    const BUFFER_LEN: usize = 64 * 1024;
+
+    unsafe extern "C" {
+        /// `int getattrlistbulk(int, struct attrlist *, void *, size_t, uint64_t)`
+        /// from `unistd.h`.
+        fn getattrlistbulk(
+            dirfd: c_int,
+            alist: *const AttrList,
+            buf: *mut c_void,
+            size: usize,
+            options: u64,
+        ) -> c_int;
+    }
+
+    pub(super) fn list_bulk(dir: &File) -> io::Result<Vec<Listed>> {
+        let request = AttrList {
+            bitmapcount: bulk::BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: bulk::COMMON,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: bulk::FILE,
+            forkattr: 0,
+        };
+        let mut buf = vec![0u8; BUFFER_LEN];
+        let mut entries = Vec::new();
+
+        loop {
+            // SAFETY: `dir` is an open descriptor for the whole call. `request`
+            // is a live `struct attrlist`. `buf` is `BUFFER_LEN` writable bytes
+            // and that is the size passed. The kernel retains neither pointer.
+            let rc = unsafe {
+                getattrlistbulk(
+                    dir.as_raw_fd(),
+                    &raw const request,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                )
+            };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if rc == 0 {
+                return Ok(entries);
+            }
+
+            let count = usize::try_from(rc).expect("a positive c_int fits in usize");
+            bulk::decode(&buf, count, &mut entries).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "unexpected attribute record")
+            })?;
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod sys {
+    use std::fs::File;
+    use std::io;
+
+    use super::Listed;
+
+    pub(super) fn list_bulk(_dir: &File) -> io::Result<Vec<Listed>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "disk-health runs on macOS",
+        ))
     }
 }
 
@@ -301,6 +690,7 @@ impl Measure {
     ///     dev: 1,
     ///     ino: 1,
     ///     len: 0,
+    ///     nlink: 1,
     ///     mtime: None,
     ///     flags: 0,
     /// };
@@ -325,6 +715,7 @@ impl Measure {
     ///     dev: 1,
     ///     ino: 1,
     ///     len: 3,
+    ///     nlink: 1,
     ///     mtime: None,
     ///     flags: 0,
     /// };
@@ -380,44 +771,88 @@ impl Measure {
 /// assert_eq!(measured.apparent_bytes, 4);
 /// ```
 pub fn measure(fs: &dyn Fs, root: &Path, root_meta: &EntryMeta) -> Result<Measure> {
+    measure_children(fs, root, root_meta, &[]).map(|(measured, _)| measured)
+}
+
+/// Measures `root` and, in the same walk, the bytes under some of its children.
+///
+/// The second value is the apparent size below the direct children of `root`
+/// whose names are in `named`. A worktree row reports its build output this
+/// way without walking that output twice.
+///
+/// # Errors
+///
+/// Returns an error when `root` itself cannot be listed.
+///
+/// # Examples
+///
+/// ```
+/// use disk_health::walk::{Fs, MemFs, measure_children};
+/// use std::path::Path;
+/// use std::time::SystemTime;
+///
+/// let fs = MemFs::new();
+/// let when = SystemTime::UNIX_EPOCH;
+/// fs.dir("/repo", 1, when);
+/// fs.file("/repo/main.rs", 1, 3, when);
+/// fs.dir("/repo/target", 1, when);
+/// fs.file("/repo/target/app", 1, 40, when);
+/// let meta = fs.meta(Path::new("/repo")).unwrap();
+/// let (whole, build) = measure_children(&fs, Path::new("/repo"), &meta, &["target"]).unwrap();
+/// assert_eq!(whole.apparent_bytes, 43);
+/// assert_eq!(build, 40);
+/// ```
+pub fn measure_children(
+    fs: &dyn Fs,
+    root: &Path,
+    root_meta: &EntryMeta,
+    named: &[&str],
+) -> Result<(Measure, u64)> {
     if root_meta.kind == Kind::File {
-        return Ok(Measure::leaf(root_meta.len, root_meta.mtime, 0));
+        return Ok((Measure::leaf(root_meta.len, root_meta.mtime, 0), 0));
     }
     if root_meta.kind != Kind::Directory {
-        return Ok(Measure::leaf(0, root_meta.mtime, ISSUE_PARTIAL));
+        return Ok((Measure::leaf(0, root_meta.mtime, ISSUE_PARTIAL), 0));
     }
 
     let mut state = MeasureState::new(root_meta);
-    let mut stack = Vec::new();
-
     // Only the candidate's own listing is an error. A child that cannot be
     // listed is a partial measure: the candidate still exists, the size does not.
-    for name in fs.read_dir(root)? {
-        state.child(fs, &root.join(name), root_meta, &mut stack);
+    let listing = fs.read_dir(root)?;
+    for entry in listing.entries {
+        let tallied = named.iter().any(|name| entry.name == *name);
+        state.child(root, entry, tallied);
     }
-    while let Some(dir) = stack.pop() {
-        state.enter(fs, &dir, root_meta, &mut stack);
+    while let Some((dir, tallied)) = state.stack.pop() {
+        state.enter(fs, &dir, tallied);
     }
 
-    Ok(state.finish())
+    Ok((state.finish(), state.tally))
 }
 
 struct MeasureState {
+    root_dev: u64,
     bytes: u64,
+    /// Bytes below the named children. Always part of `bytes` too.
+    tally: u64,
     newest: Option<SystemTime>,
+    /// Hardlinked files already counted. A file with one link cannot repeat.
     seen: HashSet<(u64, u64)>,
+    /// Directories still to list, and whether they sit below a named child.
+    stack: Vec<(PathBuf, bool)>,
     issues: u8,
     unreadable: u64,
 }
 
 impl MeasureState {
     fn new(root_meta: &EntryMeta) -> Self {
-        let mut seen = HashSet::new();
-        seen.insert((root_meta.dev, root_meta.ino));
         Self {
+            root_dev: root_meta.dev,
             bytes: 0,
+            tally: 0,
             newest: root_meta.mtime,
-            seen,
+            seen: HashSet::new(),
+            stack: Vec::new(),
             issues: if root_meta.mtime.is_none() {
                 ISSUE_UNKNOWN_AGE
             } else {
@@ -427,50 +862,59 @@ impl MeasureState {
         }
     }
 
-    fn enter(&mut self, fs: &dyn Fs, dir: &Path, root_meta: &EntryMeta, stack: &mut Vec<PathBuf>) {
-        let names = match fs.read_dir(dir) {
-            Ok(names) => names,
+    fn enter(&mut self, fs: &dyn Fs, dir: &Path, tallied: bool) {
+        let listing = match fs.read_dir(dir) {
+            Ok(listing) => listing,
             Err(err) if err.is_not_found() => return,
             Err(_) => {
                 self.note_unreadable();
                 return;
             }
         };
+        // The parent's listing can describe a mount point as the directory
+        // under it. The directory that was actually opened cannot.
+        if listing.dev != self.root_dev {
+            self.issues |= ISSUE_CROSSED;
+            return;
+        }
 
-        for name in names {
-            self.child(fs, &dir.join(name), root_meta, stack);
+        for entry in listing.entries {
+            self.child(dir, entry, tallied);
         }
     }
 
-    fn child(&mut self, fs: &dyn Fs, path: &Path, root_meta: &EntryMeta, stack: &mut Vec<PathBuf>) {
-        let meta = match fs.meta(path) {
-            Ok(meta) => meta,
-            Err(err) if err.is_not_found() => return,
-            Err(_) => {
-                self.note_unreadable();
-                return;
-            }
+    fn child(&mut self, dir: &Path, entry: Listed, tallied: bool) {
+        let Some(meta) = entry.meta else {
+            self.note_unreadable();
+            return;
         };
 
         self.observe_time(meta.mtime);
         if meta.kind == Kind::Symlink || meta.is_dataless() {
             return;
         }
-        if meta.dev != root_meta.dev {
+        if meta.dev != self.root_dev {
             self.issues |= ISSUE_CROSSED;
-            return;
-        }
-        if !self.seen.insert((meta.dev, meta.ino)) {
             return;
         }
 
         match meta.kind {
-            Kind::Directory if path.file_name().is_some_and(|name| name == ".git") => {
+            Kind::Directory if entry.name == OsStr::new(".git") => {
                 self.issues |= ISSUE_NESTED_GIT;
             }
-            Kind::Directory => stack.push(path.to_path_buf()),
-            Kind::File => self.bytes = self.bytes.saturating_add(meta.len),
+            Kind::Directory => self.stack.push((dir.join(entry.name), tallied)),
+            Kind::File => self.count(&meta, tallied),
             Kind::Symlink | Kind::Other => {}
+        }
+    }
+
+    fn count(&mut self, meta: &EntryMeta, tallied: bool) {
+        if meta.nlink > 1 && !self.seen.insert((meta.dev, meta.ino)) {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(meta.len);
+        if tallied {
+            self.tally = self.tally.saturating_add(meta.len);
         }
     }
 
@@ -487,7 +931,7 @@ impl MeasureState {
         self.unreadable = self.unreadable.saturating_add(1);
     }
 
-    fn finish(self) -> Measure {
+    fn finish(&self) -> Measure {
         Measure {
             apparent_bytes: self.bytes,
             newest: self.newest,
@@ -504,7 +948,6 @@ fn later(left: Option<SystemTime>, right: Option<SystemTime>) -> Option<SystemTi
         (None, None) => None,
     }
 }
-
 #[derive(Clone, Copy)]
 struct NodeSeed {
     kind: Kind,
@@ -520,9 +963,26 @@ struct Node {
     dev: u64,
     ino: u64,
     len: u64,
+    nlink: u64,
     mtime: Option<SystemTime>,
     flags: u32,
     locked: bool,
+    /// Device a listing of this directory reports, when it is a mount point.
+    mounted: Option<u64>,
+}
+
+impl Node {
+    const fn meta(&self) -> EntryMeta {
+        EntryMeta {
+            kind: self.kind,
+            dev: self.dev,
+            ino: self.ino,
+            len: self.len,
+            nlink: self.nlink,
+            mtime: self.mtime,
+            flags: self.flags,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -633,6 +1093,77 @@ impl MemFs {
         );
     }
 
+    /// Inserts a second name for the regular file at `existing`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `existing` was never inserted or is not a regular file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use disk_health::walk::{Fs, MemFs};
+    /// use std::path::Path;
+    /// use std::time::SystemTime;
+    ///
+    /// let fs = MemFs::new();
+    /// fs.file("/blob", 1, 4, SystemTime::UNIX_EPOCH);
+    /// fs.hardlink("/again", Path::new("/blob"));
+    /// let first = fs.meta(Path::new("/blob")).unwrap();
+    /// let second = fs.meta(Path::new("/again")).unwrap();
+    /// assert_eq!(first.ino, second.ino);
+    /// assert_eq!(second.nlink, 2);
+    /// ```
+    #[track_caller]
+    pub fn hardlink(&self, path: impl Into<PathBuf>, existing: &Path) {
+        let mut state = self.lock();
+        let linked = match state.nodes.get_mut(existing) {
+            Some(node) if node.kind == Kind::File => {
+                node.nlink += 1;
+                Node {
+                    locked: false,
+                    ..*node
+                }
+            }
+            _ => panic!("no fixture file at {}", existing.display()),
+        };
+        state.nodes.insert(path.into(), linked);
+    }
+
+    /// Makes an existing directory a mount point for device `dev`.
+    ///
+    /// Its parent's listing keeps reporting the directory's own device, the
+    /// way a bulk listing describes what is under a mount. Only opening the
+    /// directory shows `dev`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `path` was never inserted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use disk_health::walk::{Fs, MemFs};
+    /// use std::path::Path;
+    /// use std::time::SystemTime;
+    ///
+    /// let fs = MemFs::new();
+    /// fs.dir("/cache", 1, SystemTime::UNIX_EPOCH);
+    /// fs.dir("/cache/mnt", 1, SystemTime::UNIX_EPOCH);
+    /// fs.mount(Path::new("/cache/mnt"), 2);
+    /// let parent = fs.read_dir(Path::new("/cache")).unwrap();
+    /// assert_eq!(parent.entries[0].meta.unwrap().dev, 1);
+    /// assert_eq!(fs.read_dir(Path::new("/cache/mnt")).unwrap().dev, 2);
+    /// ```
+    #[track_caller]
+    pub fn mount(&self, path: &Path, dev: u64) {
+        let mut state = self.lock();
+        let Some(node) = state.nodes.get_mut(path) else {
+            panic!("no fixture node at {}", path.display());
+        };
+        node.mounted = Some(dev);
+    }
+
     /// Sets `st_flags` on an existing path.
     ///
     /// # Panics
@@ -720,9 +1251,11 @@ impl MemFs {
                 dev: node.dev,
                 ino,
                 len: node.len,
+                nlink: 1,
                 mtime: node.mtime,
                 flags: node.flags,
                 locked: false,
+                mounted: None,
             },
         );
     }
@@ -737,20 +1270,14 @@ impl MemFs {
 impl Fs for MemFs {
     fn meta(&self, path: &Path) -> Result<EntryMeta> {
         let state = self.lock();
-        let Some(node) = state.nodes.get(path) else {
-            return Err(missing(path));
-        };
-        Ok(EntryMeta {
-            kind: node.kind,
-            dev: node.dev,
-            ino: node.ino,
-            len: node.len,
-            mtime: node.mtime,
-            flags: node.flags,
-        })
+        state
+            .nodes
+            .get(path)
+            .map(Node::meta)
+            .ok_or_else(|| missing(path))
     }
 
-    fn read_dir(&self, path: &Path) -> Result<Vec<std::ffi::OsString>> {
+    fn read_dir(&self, path: &Path) -> Result<Listing> {
         let state = self.lock();
         let Some(node) = state.nodes.get(path) else {
             return Err(missing(path));
@@ -762,15 +1289,22 @@ impl Fs for MemFs {
                 std::io::Error::new(ErrorKind::InvalidInput, "not a directory"),
             ));
         }
-        let mut names = Vec::new();
-        for child in state.nodes.keys() {
+
+        let mut entries = Vec::new();
+        for (child, child_node) in &state.nodes {
             if child.parent() == Some(path)
                 && let Some(name) = child.file_name()
             {
-                names.push(name.to_os_string());
+                entries.push(Listed {
+                    name: name.to_os_string(),
+                    meta: Some(child_node.meta()),
+                });
             }
         }
-        Ok(names)
+        Ok(Listing {
+            dev: node.mounted.unwrap_or(node.dev),
+            entries,
+        })
     }
 
     fn probe_lock(&self, path: &Path) -> Result<LockProbe> {
@@ -784,6 +1318,15 @@ impl Fs for MemFs {
             LockProbe::Free
         })
     }
+
+    fn canonical(&self, path: &Path) -> Result<PathBuf> {
+        // No node stores a symlink target, so there is nothing to resolve.
+        if self.lock().nodes.contains_key(path) {
+            Ok(path.to_path_buf())
+        } else {
+            Err(missing(path))
+        }
+    }
 }
 
 fn missing(path: &Path) -> Error {
@@ -792,4 +1335,151 @@ fn missing(path: &Path) -> Error {
         path,
         std::io::Error::new(ErrorKind::NotFound, "no such path"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("disk-health-walk-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(fs::canonicalize(&path).unwrap())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Every field the walk reads must be what `lstat` says. Age gates and
+    /// the identity check at apply compare these values.
+    fn assert_listing_matches_lstat(dir: &Path) {
+        let listing = RealFs.read_dir(dir).unwrap();
+        let mut names = Vec::new();
+        for entry in &listing.entries {
+            let path = dir.join(&entry.name);
+            let Ok(expected) = RealFs.meta(&path) else {
+                continue;
+            };
+            let mut listed = entry.meta.unwrap_or_else(|| panic!("{}", path.display()));
+            // A listing only reports sizes and link counts for regular files.
+            if expected.kind != Kind::File {
+                listed.len = expected.len;
+                listed.nlink = expected.nlink;
+            }
+            assert_eq!(listed, expected, "{}", path.display());
+            names.push(entry.name.clone());
+        }
+
+        let mut expected = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        expected.sort();
+        assert_eq!(names, expected, "{}", dir.display());
+    }
+
+    #[test]
+    fn bulk_listing_agrees_with_lstat() {
+        let scratch = Scratch::new("bulk");
+        let dir = &scratch.0;
+        fs::write(dir.join("empty"), b"").unwrap();
+        fs::write(dir.join("blob"), vec![7u8; 70_000]).unwrap();
+        fs::write(dir.join("na\u{ef}ve \u{1f980}.txt"), b"unicode").unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+        fs::hard_link(dir.join("blob"), dir.join("blob-again")).unwrap();
+        symlink(dir.join("sub"), dir.join("to-sub")).unwrap();
+        symlink("/nowhere", dir.join("dangling")).unwrap();
+        assert_listing_matches_lstat(dir);
+
+        // More names than one buffer holds, so the call loops.
+        let many = dir.join("many");
+        fs::create_dir(&many).unwrap();
+        for index in 0..3_000 {
+            fs::write(
+                many.join(format!("file-with-a-longer-name-{index:05}")),
+                b"x",
+            )
+            .unwrap();
+        }
+        assert_eq!(RealFs.read_dir(&many).unwrap().entries.len(), 3_000);
+        assert_listing_matches_lstat(&many);
+    }
+
+    #[test]
+    fn bulk_listing_agrees_with_lstat_on_system_directories() {
+        // `/usr/bin` holds transparently compressed files, whose stored
+        // length is not their size.
+        for dir in ["/usr/bin", "/private/etc", env!("CARGO_MANIFEST_DIR")] {
+            assert_listing_matches_lstat(Path::new(dir));
+        }
+    }
+
+    #[test]
+    fn listing_does_not_open_a_symlink_to_a_directory() {
+        let scratch = Scratch::new("nofollow");
+        let precious = scratch.0.join("precious");
+        fs::create_dir(&precious).unwrap();
+        fs::write(precious.join("secret"), b"keep").unwrap();
+        symlink(&precious, scratch.0.join("link")).unwrap();
+
+        assert!(RealFs.read_dir(&scratch.0.join("link")).is_err());
+        assert_eq!(RealFs.read_dir(&precious).unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn canonical_resolves_symlinks_and_stored_case() {
+        let scratch = Scratch::new("canonical");
+        let real = scratch.0.join("Real");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, scratch.0.join("alias")).unwrap();
+        assert_eq!(RealFs.canonical(&scratch.0.join("alias")).unwrap(), real);
+
+        // Only a case-insensitive volume resolves this spelling at all.
+        let shouted = scratch.0.join("REAL");
+        if shouted.exists() {
+            assert_eq!(RealFs.canonical(&shouted).unwrap(), real);
+        }
+    }
+
+    #[test]
+    fn hardlinked_file_is_counted_once_and_single_links_are_not_tracked() {
+        let fs = MemFs::new();
+        let when = SystemTime::UNIX_EPOCH;
+        fs.dir("/cache", 1, when);
+        fs.file("/cache/a", 1, 100, when);
+        fs.hardlink("/cache/b", Path::new("/cache/a"));
+        fs.file("/cache/c", 1, 5, when);
+
+        let meta = fs.meta(Path::new("/cache")).unwrap();
+        let measured = measure(&fs, Path::new("/cache"), &meta).unwrap();
+        assert_eq!(measured.apparent_bytes, 105);
+    }
+
+    #[test]
+    fn truncated_or_unrequested_record_is_an_error() {
+        let mut out = Vec::new();
+        // Claims 64 bytes and has 8.
+        let short = [64u8, 0, 0, 0, 0, 0, 0, 0];
+        assert!(bulk::decode(&short, 1, &mut out).is_none());
+
+        // 24 bytes: length, then a returned set with a bit nobody asked for.
+        let mut record = [0u8; 24];
+        record[..4].copy_from_slice(&24u32.to_ne_bytes());
+        record[4..8].copy_from_slice(&0x0000_0004u32.to_ne_bytes());
+        assert!(bulk::decode(&record, 1, &mut out).is_none());
+        assert_eq!(out, []);
+    }
 }

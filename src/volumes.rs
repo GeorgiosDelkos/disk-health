@@ -8,7 +8,7 @@
 //!
 //! Classification is pure. The unsafe call only fills the buffer.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 
@@ -24,6 +24,7 @@ const OFF_BSIZE: usize = 0;
 const OFF_BLOCKS: usize = 8;
 const OFF_BFREE: usize = 16;
 const OFF_BAVAIL: usize = 24;
+const OFF_FSID: usize = 48;
 const OFF_FLAGS: usize = 64;
 const OFF_FSTYPE: usize = 72;
 const FSTYPE_LEN: usize = 16;
@@ -43,6 +44,8 @@ pub struct Volume {
     pub used_bytes: u64,
     /// `f_bavail * f_bsize`. On the Data volume this excludes purgeable snapshots.
     pub available_bytes: u64,
+    /// `st_dev` of files on this mount. `f_fsid.val[0]` in `statfs`.
+    pub dev: u64,
     /// Whether a usage walk may start here.
     pub walkable: bool,
     /// Why it is dimmed, or the Data-volume purgeable note.
@@ -58,6 +61,8 @@ pub struct MountRaw {
     pub fstype: String,
     /// `f_flags`.
     pub flags: u32,
+    /// `f_fsid.val[0]`, which is the device number `stat` reports.
+    pub fsid: u32,
     /// `f_bsize` widened to a byte count.
     pub bsize: u64,
     /// `f_blocks`.
@@ -97,6 +102,7 @@ pub fn parse_statfs(record: &[u8]) -> Result<MountRaw> {
         bfree: read_u64(record, OFF_BFREE),
         bavail: read_u64(record, OFF_BAVAIL),
         flags: read_u32(record, OFF_FLAGS),
+        fsid: read_u32(record, OFF_FSID),
         fstype: c_string(record, OFF_FSTYPE, FSTYPE_LEN),
         mount: c_string(record, OFF_MOUNT, MOUNT_LEN),
     })
@@ -117,6 +123,7 @@ pub fn parse_statfs(record: &[u8]) -> Result<MountRaw> {
 ///     mount: "/Volumes/Source".to_owned(),
 ///     fstype: "apfs".to_owned(),
 ///     flags: 0x1000,
+///     fsid: 7,
 ///     bsize: 4096,
 ///     blocks: 10,
 ///     bfree: 4,
@@ -138,6 +145,7 @@ pub fn describe(raw: &MountRaw) -> Volume {
         total_bytes,
         used_bytes,
         available_bytes,
+        dev: u64::from(raw.fsid),
         walkable,
         note,
     }
@@ -208,11 +216,11 @@ pub const fn supported_here() -> bool {
 /// Length of one `statfs` record. Public so the fixture test can size a buffer.
 pub const STATFS_LEN: usize = STATFS_SIZE;
 
-/// Longest walkable mount that is a prefix of `home`, excluding `/`.
+/// The walkable mount whose device is `home_dev`.
 ///
-/// `/` is a prefix of every absolute path. Using it as the usage root would
-/// walk the whole machine. When home is not under a more specific walkable
-/// mount, the caller passes `--volume`.
+/// The device decides, not the path. `/Users` is a firmlink into
+/// `/System/Volumes/Data`, so no mount point is a prefix of a home directory
+/// except `/`, and `/` is the sealed system volume.
 ///
 /// # Examples
 ///
@@ -220,30 +228,31 @@ pub const STATFS_LEN: usize = STATFS_SIZE;
 /// use disk_health::volumes::{Volume, home_volume};
 /// use std::path::Path;
 ///
-/// let volumes = vec![volume("/", true), volume("/Users", true)];
-/// let found = home_volume(Path::new("/Users/ada"), &volumes);
-/// assert_eq!(found.map(|item| item.mount.clone()).as_deref(), Some(Path::new("/Users")));
+/// let volumes = vec![volume("/", 1), volume("/System/Volumes/Data", 2)];
+/// let found = home_volume(2, &volumes);
+/// assert_eq!(
+///     found.map(|item| item.mount.as_path()),
+///     Some(Path::new("/System/Volumes/Data"))
+/// );
 ///
-/// fn volume(mount: &str, walkable: bool) -> Volume {
+/// fn volume(mount: &str, dev: u64) -> Volume {
 ///     Volume {
 ///         mount: std::path::PathBuf::from(mount),
 ///         fstype: "apfs".to_owned(),
 ///         total_bytes: 1,
 ///         used_bytes: 1,
 ///         available_bytes: 1,
-///         walkable,
+///         dev,
+///         walkable: true,
 ///         note: None,
 ///     }
 /// }
 /// ```
 #[must_use]
-pub fn home_volume<'a>(home: &Path, volumes: &'a [Volume]) -> Option<&'a Volume> {
+pub fn home_volume(home_dev: u64, volumes: &[Volume]) -> Option<&Volume> {
     volumes
         .iter()
-        .filter(|volume| volume.walkable)
-        .filter(|volume| volume.mount != Path::new("/"))
-        .filter(|volume| home.starts_with(&volume.mount))
-        .max_by_key(|volume| volume.mount.components().count())
+        .find(|volume| volume.walkable && volume.dev == home_dev)
 }
 
 fn classify(mount: &str, fstype: &str, flags: u32) -> (bool, Option<&'static str>) {
@@ -259,11 +268,13 @@ fn classify(mount: &str, fstype: &str, flags: u32) -> (bool, Option<&'static str
     if flags & MNT_AUTOMOUNTED != 0 {
         return (false, Some("automounted"));
     }
-    if flags & MNT_DONTBROWSE != 0 {
-        return (false, Some("nobrowse"));
-    }
+    // Before the nobrowse test: macOS mounts the Data volume nobrowse, and it
+    // is the volume a home directory is on.
     if mount == "/System/Volumes/Data" {
         return (true, Some("available excludes purgeable snapshots"));
+    }
+    if flags & MNT_DONTBROWSE != 0 {
+        return (false, Some("nobrowse"));
     }
     (true, None)
 }
@@ -398,6 +409,17 @@ mod tests {
     }
 
     #[test]
+    fn mount_device_matches_stat_of_the_mount_point() {
+        use std::os::darwin::fs::MetadataExt;
+
+        let mounts = list_mounts().unwrap();
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let home_dev = std::fs::metadata(&home).unwrap().st_dev();
+        let found = home_volume(home_dev, &mounts).expect("the home volume is walkable");
+        assert_eq!(std::fs::metadata(&found.mount).unwrap().st_dev(), home_dev);
+    }
+
+    #[test]
     fn local_apfs_is_walkable_and_sizes_match() {
         let volume =
             describe(&parse_statfs(&record("apfs", "/Volumes/Source", MNT_LOCAL)).unwrap());
@@ -413,10 +435,20 @@ mod tests {
         assert!(!system.walkable);
         let devfs = describe(&parse_statfs(&record("devfs", "/dev", MNT_LOCAL)).unwrap());
         assert!(!devfs.walkable);
+        let hidden = describe(
+            &parse_statfs(&record(
+                "apfs",
+                "/Volumes/Hidden",
+                MNT_LOCAL | MNT_DONTBROWSE,
+            ))
+            .unwrap(),
+        );
+        assert!(!hidden.walkable);
         let remote = describe(&parse_statfs(&record("apfs", "/Volumes/Net", 0)).unwrap());
         assert!(!remote.walkable);
-        let data =
-            describe(&parse_statfs(&record("apfs", "/System/Volumes/Data", MNT_LOCAL)).unwrap());
+        // The flags macOS really sets on the Data volume.
+        let flags = MNT_LOCAL | MNT_DONTBROWSE;
+        let data = describe(&parse_statfs(&record("apfs", "/System/Volumes/Data", flags)).unwrap());
         assert!(data.walkable);
         assert!(data.note.unwrap().contains("purgeable"));
     }

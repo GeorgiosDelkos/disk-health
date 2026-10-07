@@ -63,6 +63,7 @@ fn fixture_rule(relative: &'static str) -> SafeRule {
         min_age: rules::HOT_WINDOW,
         regenerate: Some("refill"),
         rationale: "fixture",
+        locks: &[],
     }
 }
 
@@ -167,10 +168,12 @@ fn target_without_a_regular_cargo_toml_is_not_a_candidate() {
     fs.dir("/h", 1, old());
     fs.dir("/h/lonely", 1, old());
     fs.dir("/h/lonely/target", 1, old());
+    fs.file("/h/lonely/target/CACHEDIR.TAG", 1, 43, old());
     fs.file("/h/lonely/target/a.o", 1, 8, old());
     fs.dir("/h/linked", 1, old());
     fs.symlink("/h/linked/Cargo.toml", old());
     fs.dir("/h/linked/target", 1, old());
+    fs.file("/h/linked/target/CACHEDIR.TAG", 1, 43, old());
     fs.file("/h/linked/target/a.o", 1, 8, old());
 
     let git = MapGit::default();
@@ -232,6 +235,7 @@ fn denylist_beats_a_rule_that_names_the_path() {
             min_age: rules::HOT_WINDOW,
             regenerate: Some("no"),
             rationale: "must not match",
+            locks: &[],
         },
     ];
     // The system rule is resolved against home `/`, so it lands on `/System/cache`.
@@ -254,6 +258,7 @@ fn different_device_is_not_entered() {
     fs.dir("/h/proj/other", 2, old());
     fs.file("/h/proj/other/Cargo.toml", 2, 2, old());
     fs.dir("/h/proj/other/target", 2, old());
+    fs.file("/h/proj/other/target/CACHEDIR.TAG", 2, 43, old());
     fs.file("/h/proj/other/target/a.o", 2, 1_000, old());
 
     let git = MapGit::default();
@@ -308,6 +313,7 @@ fn dataless_directory_is_not_descended() {
     fs.set_flags(Path::new("/h/proj/cloud"), SF_DATALESS);
     fs.file("/h/proj/cloud/Cargo.toml", 1, 2, old());
     fs.dir("/h/proj/cloud/target", 1, old());
+    fs.file("/h/proj/cloud/target/CACHEDIR.TAG", 1, 43, old());
     fs.file("/h/proj/cloud/target/a.o", 1, 8, old());
 
     let git = MapGit::default();
@@ -408,8 +414,7 @@ fn dirty_tree_is_not_staged_and_clean_tree_is() {
         let project = format!("/h/{name}");
         fs.dir(&project, 1, old());
         fs.file(format!("{project}/Cargo.toml"), 1, 2, old());
-        fs.dir(format!("{project}/target"), 1, old());
-        fs.file(format!("{project}/target/a.o"), 1, 8, old());
+        cargo_target(&fs, &project);
     }
     let mut git = MapGit::default();
     git.by_path
@@ -444,6 +449,176 @@ fn dirty_tree_is_not_staged_and_clean_tree_is() {
     assert_eq!(clean.tier, Tier::Caution);
 }
 
+/// A `target` directory cargo would recognize as its own, with one object file.
+fn cargo_target(fs: &MemFs, project: &str) {
+    fs.dir(format!("{project}/target"), 1, old());
+    fs.file(format!("{project}/target/CACHEDIR.TAG"), 1, 43, old());
+    fs.dir(format!("{project}/target/debug"), 1, old());
+    fs.file(format!("{project}/target/debug/.cargo-lock"), 1, 0, old());
+    fs.file(format!("{project}/target/debug/a.o"), 1, 8, old());
+}
+
+fn scan_projects(fs: &MemFs, git: &dyn disk_health::git::GitProbe) -> Report {
+    let home = PathBuf::from("/h");
+    let roots = [home.clone()];
+    scan(&ScanOptions {
+        home: &home,
+        roots: &roots,
+        safe_rules: &[],
+        project_rules: &rules::builtin_project(),
+        deny: &deny_prefixes(&home, &[]),
+        now: now(),
+        git,
+        fs,
+        progress: None,
+        on_finding: None,
+    })
+    .expect("a scan worker can be spawned")
+}
+
+#[test]
+fn directory_named_target_that_cargo_did_not_write_is_not_a_candidate() {
+    let fs = MemFs::new();
+    fs.dir("/h", 1, old());
+    fs.dir("/h/crate", 1, old());
+    fs.file("/h/crate/Cargo.toml", 1, 2, old());
+    fs.dir("/h/crate/target", 1, old());
+    fs.file("/h/crate/target/quarterly-targets.xlsx", 1, 900, old());
+
+    let report = scan_projects(&fs, &MapGit::default());
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+}
+
+#[test]
+fn cargo_build_lock_holds_the_target_at_either_depth() {
+    for lock in [
+        "/h/crate/target/debug/.cargo-lock",
+        "/h/crate/target/aarch64-apple-darwin/release/.cargo-lock",
+    ] {
+        let fs = MemFs::new();
+        fs.dir("/h", 1, old());
+        fs.dir("/h/crate", 1, old());
+        fs.file("/h/crate/Cargo.toml", 1, 2, old());
+        cargo_target(&fs, "/h/crate");
+        fs.dir("/h/crate/target/aarch64-apple-darwin", 1, old());
+        fs.dir("/h/crate/target/aarch64-apple-darwin/release", 1, old());
+        fs.file(
+            "/h/crate/target/aarch64-apple-darwin/release/.cargo-lock",
+            1,
+            0,
+            old(),
+        );
+
+        let free = scan_projects(&fs, &MapGit::default());
+        assert!(free.findings[0].staged(), "{:?}", free.findings);
+
+        // The directory is not locked. Only the file cargo holds is.
+        fs.lock_path(Path::new(lock));
+        let held = scan_projects(&fs, &MapGit::default());
+        assert_eq!(held.findings[0].skip, Some(Skip::Locked), "{lock}");
+    }
+}
+
+#[test]
+fn cargo_home_lock_holds_the_registry() {
+    let fs = MemFs::new();
+    fs.dir("/h", 1, old());
+    fs.dir("/h/.cargo", 1, old());
+    fs.file("/h/.cargo/.package-cache", 1, 0, old());
+    fs.dir("/h/.cargo/registry", 1, old());
+    fs.file("/h/.cargo/registry/crate.tar", 1, 64, old());
+    fs.lock_path(Path::new("/h/.cargo/.package-cache"));
+
+    let home = PathBuf::from("/h");
+    let report = run(
+        &fs,
+        &MapGit::default(),
+        &home,
+        &[],
+        &rules::builtin_safe(),
+        &[],
+        &deny_prefixes(&home, &[]),
+    );
+    assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+    assert_eq!(report.findings[0].skip, Some(Skip::Locked));
+}
+
+#[test]
+fn mount_point_listed_as_a_plain_directory_is_not_entered() {
+    let fs = MemFs::new();
+    fs.dir("/h", 1, old());
+    // Inside a candidate: the cache must not be staged or sized through it.
+    fs.dir("/h/crate", 1, old());
+    fs.file("/h/crate/Cargo.toml", 1, 2, old());
+    cargo_target(&fs, "/h/crate");
+    fs.dir("/h/crate/target/mnt", 1, old());
+    fs.file("/h/crate/target/mnt/other-disk.img", 2, 1_000_000, old());
+    fs.mount(Path::new("/h/crate/target/mnt"), 2);
+    // An empty mount has no child to give the other device away.
+    fs.dir("/h/idle", 1, old());
+    fs.file("/h/idle/Cargo.toml", 1, 2, old());
+    cargo_target(&fs, "/h/idle");
+    fs.dir("/h/idle/target/mnt", 1, old());
+    fs.mount(Path::new("/h/idle/target/mnt"), 2);
+    // On the way to a candidate: the walk must not find a project behind it.
+    fs.dir("/h/backup", 1, old());
+    fs.file("/h/backup/Cargo.toml", 2, 2, old());
+    cargo_target(&fs, "/h/backup");
+    fs.mount(Path::new("/h/backup"), 2);
+
+    let report = scan_projects(&fs, &MapGit::default());
+    assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+    for (finding, path) in report
+        .findings
+        .iter()
+        .zip(["/h/crate/target", "/h/idle/target"])
+    {
+        assert_eq!(finding.path, Path::new(path));
+        assert_eq!(finding.skip, Some(Skip::CrossedDevice), "{path}");
+        assert_eq!(finding.apparent_bytes, 43 + 8, "{path}");
+    }
+
+    let tree = disk_health::usage::walk(&fs, Path::new("/h"), 4, None).unwrap();
+    assert_eq!(tree.apparent_bytes, 2 * (2 + 43 + 8));
+}
+
+/// Counts how often the scan asks about a project.
+#[derive(Default)]
+struct CountingGit(std::sync::atomic::AtomicUsize);
+
+impl disk_health::git::GitProbe for CountingGit {
+    fn status(&self, _project: &Path) -> GitTree {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GitTree::Clean
+    }
+}
+
+#[test]
+fn git_is_asked_once_per_project_not_once_per_rule() {
+    let fs = MemFs::new();
+    fs.dir("/h", 1, old());
+    fs.dir("/h/app", 1, old());
+    fs.file("/h/app/package.json", 1, 2, old());
+    fs.file("/h/app/package-lock.json", 1, 2, old());
+    for child in ["node_modules", ".next", ".turbo"] {
+        fs.dir(format!("/h/app/{child}"), 1, old());
+        fs.file(format!("/h/app/{child}/blob"), 1, 4, old());
+    }
+
+    let git = CountingGit::default();
+    let report = scan_projects(&fs, &git);
+    assert_eq!(report.findings.len(), 3, "{:?}", report.findings);
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(disk_health::scan::Finding::staged)
+    );
+    // Two workers can race to the first answer, so the bound is not exactly 1.
+    let asked = git.0.load(std::sync::atomic::Ordering::Relaxed);
+    assert!((1..3).contains(&asked), "git status ran {asked} times");
+}
+
 #[test]
 fn random_trees_never_stage_a_symlink_or_a_denied_path() {
     let mut rng = XorShift(0xD15C_5AFE);
@@ -460,6 +635,7 @@ fn random_trees_never_stage_a_symlink_or_a_denied_path() {
         fs.dir("/System/evil", 1, old());
         fs.file("/System/evil/Cargo.toml", 1, 2, old());
         fs.dir("/System/evil/target", 1, old());
+        fs.file("/System/evil/target/CACHEDIR.TAG", 1, 43, old());
         fs.file("/System/evil/target/a.o", 1, 8, old());
 
         let app = format!("/h/work/app{iteration}");
