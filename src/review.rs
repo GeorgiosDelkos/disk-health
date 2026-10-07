@@ -10,12 +10,15 @@
 //! `pnpm` and `rustup` are advice text. Nothing here execs them.
 
 use std::ffi::OsString;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::git::{WorktreeGit, WorktreeStatus};
 use crate::json;
-use crate::walk::{Fs, Kind, measure};
+use crate::walk::{Fs, Kind, measure_children};
 
 /// Why the row is inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +196,10 @@ const FIXED: &[Fixed] = &[
 /// caller could read it. The active toolchain is marked from
 /// `default_toolchain`.
 ///
+/// # Panics
+///
+/// Panics if a sizing thread panics. That is a bug in the walk.
+///
 /// # Examples
 ///
 /// ```
@@ -203,6 +210,7 @@ const FIXED: &[Fixed] = &[
 /// use std::time::SystemTime;
 ///
 /// let fs = MemFs::new();
+/// fs.dir("/home", 1, SystemTime::UNIX_EPOCH);
 /// fs.dir("/home/.grok/sessions", 1, SystemTime::UNIX_EPOCH);
 /// let rows = inventory(
 ///     &fs,
@@ -222,12 +230,103 @@ pub fn inventory(
     git: &dyn WorktreeGit,
     rustup_settings: Option<&str>,
 ) -> Vec<Item> {
-    let mut items = Vec::new();
-    fixed_rows(&mut items, fs, home, now);
-    worktree_rows(&mut items, fs, home, now, git);
-    toolchain_rows(&mut items, fs, home, now, rustup_settings);
+    let mut rows = FIXED
+        .iter()
+        .map(|fixed| Row::Fixed(home.join(fixed.relative), fixed))
+        .collect::<Vec<_>>();
+    worktree_rows(&mut rows, fs, home);
+    toolchain_rows(&mut rows, fs, home, rustup_settings);
+
+    // The same confinement as the scan. `~/.rustup` linked onto an external
+    // disk is not walked, and an unknown home volume holds nothing.
+    let home_dev = fs.meta(home).ok().map(|meta| meta.dev);
+    let sizing = Sizing {
+        fs,
+        now,
+        git,
+        home_dev,
+    };
+    let mut items = measure_rows(&rows, &sizing);
     items.sort_by(|left, right| left.path.cmp(&right.path));
     items
+}
+
+/// A row that still has to be sized. Finding the rows is a few listings;
+/// sizing one is a walk of everything under it.
+enum Row {
+    Fixed(PathBuf, &'static Fixed),
+    Worktree(PathBuf),
+    Toolchain {
+        path: PathBuf,
+        name: String,
+        active: bool,
+    },
+}
+
+struct Sizing<'a> {
+    fs: &'a dyn Fs,
+    now: SystemTime,
+    git: &'a dyn WorktreeGit,
+    /// Device of the home directory. A row on another device is omitted.
+    home_dev: Option<u64>,
+}
+
+/// Most rows sized at once. The work is waiting on directory reads.
+const MAX_SIZERS: usize = 8;
+
+/// Sizes the rows on a few threads. Each takes the next unsized row.
+fn measure_rows(rows: &[Row], sizing: &Sizing<'_>) -> Vec<Item> {
+    let next = AtomicUsize::new(0);
+    let take = || {
+        let mut items = Vec::new();
+        // `Relaxed`: the counter only hands out indexes. Nothing else is
+        // published through it.
+        while let Some(row) = rows.get(next.fetch_add(1, Ordering::Relaxed)) {
+            items.extend(row.item(sizing));
+        }
+        items
+    };
+
+    let sizers = thread::available_parallelism()
+        .map_or(1, NonZero::get)
+        .min(MAX_SIZERS)
+        .min(rows.len());
+    thread::scope(|scope| {
+        let handles = (1..sizers)
+            .filter_map(|_| thread::Builder::new().spawn_scoped(scope, take).ok())
+            .collect::<Vec<_>>();
+        // This thread works too, so a refused spawn only makes the rest slower.
+        let mut items = take();
+        for handle in handles {
+            // A sizer's panic is this call's panic. It is not swallowed here.
+            items.extend(
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        items
+    })
+}
+
+impl Row {
+    fn item(&self, sizing: &Sizing<'_>) -> Option<Item> {
+        match self {
+            Self::Fixed(path, fixed) => {
+                let size = size_of(sizing, path)?;
+                Some(fixed_item(path, size, fixed))
+            }
+            Self::Worktree(path) => {
+                let (size, caution_child_bytes) = size_with(sizing, path, CAUTION_CHILDREN)?;
+                let status = sizing.git.inspect(path);
+                Some(worktree_item(path, size, caution_child_bytes, status))
+            }
+            Self::Toolchain { path, name, active } => {
+                let size = size_of(sizing, path)?;
+                Some(toolchain_item(path, size, name, *active))
+            }
+        }
+    }
 }
 
 /// Appends review objects. The caller writes the surrounding array.
@@ -273,42 +372,30 @@ pub fn append_json(out: &mut String, items: &[Item]) {
     }
 }
 
-fn fixed_rows(items: &mut Vec<Item>, fs: &dyn Fs, home: &Path, now: SystemTime) {
-    for fixed in FIXED {
-        let path = home.join(fixed.relative);
-        let Some(size) = size_of(fs, &path, now) else {
-            continue;
-        };
-        items.push(Item {
-            class: fixed.class,
-            path,
-            apparent_bytes: size.bytes,
-            caution_child_bytes: 0,
-            age: size.age,
-            branch: None,
-            dirty: None,
-            upstream: None,
-            ahead: None,
-            behind: None,
-            advice: fixed.advice.map(str::to_owned),
-            active: false,
-            note: fixed.note,
-        });
+fn fixed_item(path: &Path, size: Size, fixed: &Fixed) -> Item {
+    Item {
+        class: fixed.class,
+        path: path.to_path_buf(),
+        apparent_bytes: size.bytes,
+        caution_child_bytes: 0,
+        age: size.age,
+        branch: None,
+        dirty: None,
+        upstream: None,
+        ahead: None,
+        behind: None,
+        advice: fixed.advice.map(str::to_owned),
+        active: false,
+        note: fixed.note,
     }
 }
 
-fn worktree_rows(
-    items: &mut Vec<Item>,
-    fs: &dyn Fs,
-    home: &Path,
-    now: SystemTime,
-    git: &dyn WorktreeGit,
-) {
+fn worktree_rows(rows: &mut Vec<Row>, fs: &dyn Fs, home: &Path) {
     let root = home.join(".grok/worktrees");
     for name in sorted_names(fs, &root) {
         let child = root.join(&name);
         if is_checkout(fs, &child) {
-            push_worktree(items, fs, &child, now, git);
+            rows.push(Row::Worktree(child));
             continue;
         }
         if !is_directory(fs, &child) {
@@ -317,24 +404,10 @@ fn worktree_rows(
         for nested in sorted_names(fs, &child) {
             let checkout = child.join(&nested);
             if is_checkout(fs, &checkout) {
-                push_worktree(items, fs, &checkout, now, git);
+                rows.push(Row::Worktree(checkout));
             }
         }
     }
-}
-
-fn push_worktree(
-    items: &mut Vec<Item>,
-    fs: &dyn Fs,
-    path: &Path,
-    now: SystemTime,
-    git: &dyn WorktreeGit,
-) {
-    let Some(size) = size_of(fs, path, now) else {
-        return;
-    };
-    let status = git.inspect(path);
-    items.push(worktree_item(path, size, caution_bytes(fs, path), status));
 }
 
 fn worktree_item(
@@ -360,26 +433,17 @@ fn worktree_item(
     }
 }
 
-fn toolchain_rows(
-    items: &mut Vec<Item>,
-    fs: &dyn Fs,
-    home: &Path,
-    now: SystemTime,
-    settings: Option<&str>,
-) {
+fn toolchain_rows(rows: &mut Vec<Row>, fs: &dyn Fs, home: &Path, settings: Option<&str>) {
     let root = home.join(".rustup/toolchains");
-    let active = settings.and_then(default_toolchain);
+    let default = settings.and_then(default_toolchain);
     for name in sorted_names(fs, &root) {
         let path = root.join(&name);
         if !is_directory(fs, &path) {
             continue;
         }
-        let Some(size) = size_of(fs, &path, now) else {
-            continue;
-        };
-        let label = name.to_string_lossy();
-        let marked = active.as_deref() == Some(label.as_ref());
-        items.push(toolchain_item(&path, size, &label, marked));
+        let name = name.to_string_lossy().into_owned();
+        let active = default.as_deref() == Some(name.as_str());
+        rows.push(Row::Toolchain { path, name, active });
     }
 }
 
@@ -412,37 +476,31 @@ struct Size {
     age: Option<Duration>,
 }
 
-fn size_of(fs: &dyn Fs, path: &Path, now: SystemTime) -> Option<Size> {
-    let meta = fs.meta(path).ok()?;
-    if meta.is_dataless() {
-        return None;
-    }
-    let bytes = match meta.kind {
-        Kind::File => meta.len,
-        Kind::Directory => measure(fs, path, &meta).map_or(0, |measured| measured.apparent_bytes),
-        Kind::Symlink | Kind::Other => return None,
-    };
-    Some(Size {
-        bytes,
-        age: age_of(now, meta.mtime),
-    })
+/// Build output a worktree row reports separately from its own size.
+const CAUTION_CHILDREN: &[&str] = &["target", "node_modules"];
+
+fn size_of(sizing: &Sizing<'_>, path: &Path) -> Option<Size> {
+    size_with(sizing, path, &[]).map(|(size, _)| size)
 }
 
-fn caution_bytes(fs: &dyn Fs, checkout: &Path) -> u64 {
-    let mut sum: u64 = 0;
-    for name in ["target", "node_modules"] {
-        let path = checkout.join(name);
-        let Ok(meta) = fs.meta(&path) else {
-            continue;
-        };
-        if meta.kind != Kind::Directory || meta.is_dataless() {
-            continue;
-        }
-        if let Ok(measured) = measure(fs, &path, &meta) {
-            sum = sum.saturating_add(measured.apparent_bytes);
-        }
+/// Size of `path`, and of its direct children in `named`, from one walk.
+fn size_with(sizing: &Sizing<'_>, path: &Path, named: &[&str]) -> Option<(Size, u64)> {
+    let (fs, now) = (sizing.fs, sizing.now);
+    let meta = fs.meta(path).ok()?;
+    if meta.is_dataless() || Some(meta.dev) != sizing.home_dev {
+        return None;
     }
-    sum
+    let (bytes, named_bytes) = match meta.kind {
+        Kind::File => (meta.len, 0),
+        Kind::Directory => measure_children(fs, path, &meta, named)
+            .map_or((0, 0), |(measured, named)| (measured.apparent_bytes, named)),
+        Kind::Symlink | Kind::Other => return None,
+    };
+    let size = Size {
+        bytes,
+        age: age_of(now, meta.mtime),
+    };
+    Some((size, named_bytes))
 }
 
 fn is_checkout(fs: &dyn Fs, path: &Path) -> bool {
@@ -460,7 +518,14 @@ fn is_directory(fs: &dyn Fs, path: &Path) -> bool {
 }
 
 fn sorted_names(fs: &dyn Fs, path: &Path) -> Vec<OsString> {
-    let mut names = fs.read_dir(path).unwrap_or_default();
+    let Ok(listing) = fs.read_dir(path) else {
+        return Vec::new();
+    };
+    let mut names = listing
+        .entries
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
     names.sort();
     names
 }
@@ -599,6 +664,8 @@ mod tests {
     #[test]
     fn json_objects_have_no_staged_key() {
         let fs = MemFs::new();
+        fs.dir("/home", 1, SystemTime::UNIX_EPOCH);
+        fs.dir("/Users/ada", 1, SystemTime::UNIX_EPOCH);
         fs.dir("/home/Library/pnpm/store", 1, now());
         fs.file("/home/Library/pnpm/store/pkg", 1, 8, now());
         let rows = inventory(
@@ -637,6 +704,8 @@ mod tests {
         assert!(path_is_denied(&snapshots, &deny));
 
         let fs = MemFs::new();
+        fs.dir("/home", 1, SystemTime::UNIX_EPOCH);
+        fs.dir("/Users/ada", 1, SystemTime::UNIX_EPOCH);
         fs.dir(&snapshots, 1, now());
         let rows = inventory(&fs, home, now(), &MapWorktree::default(), None);
         assert!(rows.iter().any(|row| row.path == snapshots));
@@ -645,6 +714,8 @@ mod tests {
     #[test]
     fn worktrees_are_two_levels_and_git_failure_keeps_the_row() {
         let fs = MemFs::new();
+        fs.dir("/home", 1, SystemTime::UNIX_EPOCH);
+        fs.dir("/Users/ada", 1, SystemTime::UNIX_EPOCH);
         let when = now();
         let checkout = Path::new("/home/.grok/worktrees/group/repo");
         fs.dir("/home/.grok/worktrees", 1, when);
@@ -669,6 +740,8 @@ mod tests {
     #[test]
     fn dirty_status_is_recorded_and_the_row_stays_review() {
         let fs = MemFs::new();
+        fs.dir("/home", 1, SystemTime::UNIX_EPOCH);
+        fs.dir("/Users/ada", 1, SystemTime::UNIX_EPOCH);
         let when = now();
         let checkout = Path::new("/home/.grok/worktrees/repo");
         fs.dir("/home/.grok/worktrees", 1, when);
@@ -694,6 +767,8 @@ mod tests {
     #[test]
     fn symlink_checkout_is_not_a_row() {
         let fs = MemFs::new();
+        fs.dir("/home", 1, SystemTime::UNIX_EPOCH);
+        fs.dir("/Users/ada", 1, SystemTime::UNIX_EPOCH);
         let when = now();
         fs.dir("/home/.grok/worktrees", 1, when);
         fs.symlink("/home/.grok/worktrees/link", when);
@@ -702,8 +777,29 @@ mod tests {
     }
 
     #[test]
+    fn inventory_on_another_disk_is_omitted() {
+        let fs = MemFs::new();
+        fs.dir("/home", 1, now());
+        // `~/.grok` was moved to an external disk and linked back.
+        fs.dir("/home/.grok/sessions", 2, now());
+        fs.file("/home/.grok/sessions/log", 2, 900, now());
+        fs.dir("/home/.codex/sessions", 1, now());
+        let rows = inventory(
+            &fs,
+            Path::new("/home"),
+            now(),
+            &MapWorktree::default(),
+            None,
+        );
+        let paths = rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>();
+        assert_eq!(paths, [PathBuf::from("/home/.codex/sessions")]);
+    }
+
+    #[test]
     fn dataless_inventory_is_omitted() {
         let fs = MemFs::new();
+        fs.dir("/home", 1, SystemTime::UNIX_EPOCH);
+        fs.dir("/Users/ada", 1, SystemTime::UNIX_EPOCH);
         fs.dir("/home/.grok/sessions", 1, now());
         fs.set_flags(Path::new("/home/.grok/sessions"), SF_DATALESS);
         let rows = inventory(
@@ -719,6 +815,8 @@ mod tests {
     #[test]
     fn active_toolchain_is_marked_and_advice_is_text() {
         let fs = MemFs::new();
+        fs.dir("/home", 1, SystemTime::UNIX_EPOCH);
+        fs.dir("/Users/ada", 1, SystemTime::UNIX_EPOCH);
         let when = now();
         fs.dir("/home/.rustup/toolchains", 1, when);
         fs.dir(

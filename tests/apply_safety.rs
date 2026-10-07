@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use disk_health::config::deny_prefixes;
 use disk_health::log::{Action, ActionLog, MemoryLog};
 use disk_health::plan::{Entry, Plan};
-use disk_health::rules::Tier;
+use disk_health::rules::{self, SafeAnchor, SafeRule, Tier};
 use disk_health::time::{from_unix_nanos, unix_nanos};
 use disk_health::trash::{
     ApplyReport, ApplyRequest, FsRename, PurgeRequest, Renamer, RestoreRequest, SkipMove, apply,
@@ -39,7 +39,8 @@ impl TempDir {
         ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("temp fixture directory can be created");
-        Self(path)
+        // `/var` is a symlink on macOS, and apply only moves a canonical path.
+        Self(fs::canonicalize(&path).expect("temp fixture directory can be resolved"))
     }
 
     fn path(&self) -> &Path {
@@ -113,6 +114,18 @@ fn entry_at(path: &Path, staged: bool, marker: Option<PathBuf>) -> Entry {
     }
 }
 
+/// The one safe rule these plans are checked against: `~/cache`.
+fn fixture_rules() -> [SafeRule; 1] {
+    [SafeRule {
+        id: "fixture",
+        anchor: SafeAnchor::Directory("cache"),
+        min_age: rules::HOT_WINDOW,
+        regenerate: None,
+        rationale: "fixture",
+        locks: &[],
+    }]
+}
+
 fn apply_real(
     plan: &Plan,
     confirm: &str,
@@ -126,8 +139,9 @@ fn apply_real(
         confirm,
         home,
         home_dev,
-        uid: 501,
         deny: &deny_prefixes(home, &[]),
+        safe_rules: &fixture_rules(),
+        project_rules: &rules::builtin_project(),
         fs: &RealFs,
         renamer,
         log,
@@ -225,13 +239,13 @@ fn exdev_leaves_the_source_bytes_in_place() {
     let fixture = TempDir::new("exdev");
     let home = fixture.path().join("home");
     let cache = home.join("cache");
-    fs::create_dir_all(&home).unwrap();
-    fs::write(&cache, b"keep-me").unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("blob"), b"keep-me").unwrap();
     let plan = Plan::from_entries(vec![entry_at(&cache, true, None)], "host", now());
     let mut log = MemoryLog::default();
     let report = apply_real(&plan, &plan.plan_id, &home, &Exdev, &mut log).unwrap();
 
-    assert_eq!(fs::read(&cache).unwrap(), b"keep-me");
+    assert_eq!(fs::read(cache.join("blob")).unwrap(), b"keep-me");
     assert!(
         matches!(report.skipped[0].reason, SkipMove::Exdev),
         "{:?}",
@@ -246,8 +260,8 @@ fn rename_keeps_the_inode_and_restore_puts_it_back() {
     let fixture = TempDir::new("rename");
     let home = fixture.path().join("home");
     let cache = home.join("cache");
-    fs::create_dir_all(&home).unwrap();
-    fs::write(&cache, b"bytes").unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("blob"), b"bytes").unwrap();
     let entry = entry_at(&cache, true, None);
     let inode = entry.ino;
     let plan = Plan::from_entries(vec![entry], "host", now());
@@ -259,7 +273,7 @@ fn rename_keeps_the_inode_and_restore_puts_it_back() {
     let moved = &report.moved[0];
     assert!(moved.to.starts_with(home.join(".Trash")));
     assert_eq!(RealFs.meta(&moved.to).unwrap().ino, inode);
-    assert_eq!(fs::read(&moved.to).unwrap(), b"bytes");
+    assert_eq!(fs::read(moved.to.join("blob")).unwrap(), b"bytes");
     assert!(moved.logged);
 
     let restored = restore(&RestoreRequest {
@@ -271,7 +285,7 @@ fn rename_keeps_the_inode_and_restore_puts_it_back() {
     })
     .unwrap();
     assert_eq!(restored, cache);
-    assert_eq!(fs::read(&cache).unwrap(), b"bytes");
+    assert_eq!(fs::read(cache.join("blob")).unwrap(), b"bytes");
 }
 
 #[test]
@@ -284,15 +298,8 @@ fn restore_does_not_clobber_an_existing_path() {
     fs::write(&cache, b"original").unwrap();
     fs::write(&trashed, b"trashed").unwrap();
     let action = Action {
-        id: String::new(),
-        plan_id: "plan".to_owned(),
-        rule: "fixture".to_owned(),
         from: cache.clone(),
-        to: trashed.clone(),
-        dev: 1,
-        ino: 2,
-        apparent_bytes: 8,
-        at: now(),
+        ..logged(&trashed, now())
     }
     .stamp();
     let mut log = MemoryLog::default();
@@ -392,8 +399,9 @@ fn denied_plan_path_is_not_moved() {
         confirm: &plan.plan_id,
         home: &home,
         home_dev: 1,
-        uid: 501,
         deny: &deny,
+        safe_rules: &fixture_rules(),
+        project_rules: &[],
         fs: &fs,
         renamer: &renamer,
         log: &mut log,
@@ -405,6 +413,55 @@ fn denied_plan_path_is_not_moved() {
     assert_eq!(renamer.calls(), 0);
     assert!(matches!(report.skipped[0].reason, SkipMove::Denied));
     assert_eq!(report.exit_code(), 3);
+}
+
+#[test]
+fn entry_on_another_disk_is_not_moved() {
+    let fs = disk_health::walk::MemFs::new();
+    let when = now() - Duration::from_hours(48);
+    fs.dir("/h", 1, when);
+    // The rule names this path. It is on device 2, and home is on device 1.
+    fs.dir("/h/cache", 2, when);
+    let meta = fs.meta(Path::new("/h/cache")).unwrap();
+    let entry = Entry {
+        rule: "fixture".to_owned(),
+        tier: Tier::Safe,
+        path: PathBuf::from("/h/cache"),
+        dev: meta.dev,
+        ino: meta.ino,
+        mtime_ns: meta.mtime.and_then(unix_nanos),
+        newest_child_ns: meta.mtime.and_then(unix_nanos),
+        apparent_bytes: 1,
+        staged: true,
+        regenerate: None,
+        marker: None,
+    };
+    let plan = Plan::from_entries(vec![entry], "host", now());
+    let home = PathBuf::from("/h");
+    let renamer = Recorded(Mutex::new(Vec::new()));
+    let mut log = MemoryLog::default();
+    let report = apply(ApplyRequest {
+        plan: &plan,
+        confirm: &plan.plan_id,
+        home: &home,
+        home_dev: 1,
+        deny: &deny_prefixes(&home, &[]),
+        safe_rules: &fixture_rules(),
+        project_rules: &[],
+        fs: &fs,
+        renamer: &renamer,
+        log: &mut log,
+        now: now(),
+        interrupt: None,
+    })
+    .unwrap();
+
+    assert_eq!(renamer.calls(), 0);
+    assert!(
+        matches!(report.skipped[0].reason, SkipMove::OtherVolume),
+        "{:?}",
+        report.skipped
+    );
 }
 
 #[test]
@@ -444,8 +501,9 @@ fn interrupt_stops_before_a_rename() {
         confirm: &plan.plan_id,
         home: &home,
         home_dev,
-        uid: 501,
         deny: &deny,
+        safe_rules: &fixture_rules(),
+        project_rules: &[],
         fs: &RealFs,
         renamer: &renamer,
         log: &mut log,
@@ -459,15 +517,343 @@ fn interrupt_stops_before_a_rename() {
     assert!(matches!(report.skipped[0].reason, SkipMove::Interrupted));
 }
 
+#[test]
+fn path_no_rule_produces_is_not_moved() {
+    let fixture = TempDir::new("norule");
+    let home = fixture.path().join("home");
+    let documents = home.join("Documents");
+    fs::create_dir_all(&documents).unwrap();
+    fs::write(documents.join("thesis.txt"), b"keep").unwrap();
+
+    // The id is valid for these entries. Anyone can compute it.
+    let named = entry_at(&documents, true, None);
+    let mut unknown = entry_at(&documents, true, None);
+    unknown.rule = "no-such-rule".to_owned();
+    for entry in [named, unknown] {
+        let plan = Plan::from_entries(vec![entry], "host", now());
+        let renamer = Recorded(Mutex::new(Vec::new()));
+        let mut log = MemoryLog::default();
+        let report = apply_real(&plan, &plan.plan_id, &home, &renamer, &mut log).unwrap();
+
+        assert_eq!(renamer.calls(), 0);
+        assert!(
+            matches!(report.skipped[0].reason, SkipMove::Rule),
+            "{:?}",
+            report.skipped
+        );
+    }
+    assert_eq!(fs::read(documents.join("thesis.txt")).unwrap(), b"keep");
+}
+
+#[test]
+fn target_of_a_symlink_at_the_rule_path_is_not_moved() {
+    let fixture = TempDir::new("anchorlink");
+    let home = fixture.path().join("home");
+    let precious = fixture.path().join("precious");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&precious).unwrap();
+    fs::write(precious.join("thesis.txt"), b"keep").unwrap();
+    // The fixture rule names `~/cache`, and `~/cache` is a link to this.
+    std::os::unix::fs::symlink(&precious, home.join("cache")).unwrap();
+
+    let plan = Plan::from_entries(vec![entry_at(&precious, true, None)], "host", now());
+    let renamer = Recorded(Mutex::new(Vec::new()));
+    let mut log = MemoryLog::default();
+    let report = apply_real(&plan, &plan.plan_id, &home, &renamer, &mut log).unwrap();
+
+    assert_eq!(renamer.calls(), 0);
+    assert!(
+        matches!(report.skipped[0].reason, SkipMove::Rule),
+        "{:?}",
+        report.skipped
+    );
+}
+
+/// The builtin rule for `~/.claude/shell-snapshots`: loose files, and the
+/// directory stays.
+fn aged_files_rule() -> Vec<SafeRule> {
+    rules::builtin_safe()
+        .into_iter()
+        .filter(|rule| rule.id == "claude-shell-snapshots")
+        .collect()
+}
+
+#[test]
+fn files_rule_moves_a_loose_file_and_not_the_directory_or_a_subdirectory() {
+    let fixture = TempDir::new("files");
+    let home = fixture.path().join("home");
+    let snapshots = home.join(".claude/shell-snapshots");
+    let state = snapshots.join("state");
+    let loose = snapshots.join("snapshot.sh");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(&loose, b"old").unwrap();
+    let home_dev = RealFs.meta(&home).unwrap().dev;
+
+    for (path, moved) in [(&snapshots, false), (&state, false), (&loose, true)] {
+        let entry = Entry {
+            rule: "claude-shell-snapshots".to_owned(),
+            ..entry_at(path, true, None)
+        };
+        let plan = Plan::from_entries(vec![entry], "host", now());
+        let renamer = Recorded(Mutex::new(Vec::new()));
+        let mut log = MemoryLog::default();
+        let report = apply(ApplyRequest {
+            plan: &plan,
+            confirm: &plan.plan_id,
+            home: &home,
+            home_dev,
+            deny: &deny_prefixes(&home, &[]),
+            safe_rules: &aged_files_rule(),
+            project_rules: &[],
+            fs: &RealFs,
+            renamer: &renamer,
+            log: &mut log,
+            now: now(),
+            interrupt: None,
+        })
+        .unwrap();
+
+        assert_eq!(renamer.calls(), usize::from(moved), "{}", path.display());
+        if !moved {
+            assert!(matches!(report.skipped[0].reason, SkipMove::Rule));
+        }
+    }
+}
+
+#[test]
+fn path_through_a_symlink_or_in_another_case_is_not_moved() {
+    let fixture = TempDir::new("spelling");
+    let home = fixture.path().join("home");
+    let cache = home.join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    std::os::unix::fs::symlink(&home, fixture.path().join("alias")).unwrap();
+
+    let mut spellings = vec![fixture.path().join("alias").join("cache")];
+    // Only a case-insensitive volume resolves the second spelling at all.
+    if home.join("CACHE").exists() {
+        spellings.push(home.join("CACHE"));
+    }
+    for spelling in spellings {
+        let plan = Plan::from_entries(vec![entry_at(&spelling, true, None)], "host", now());
+        let renamer = Recorded(Mutex::new(Vec::new()));
+        let mut log = MemoryLog::default();
+        let report = apply_real(&plan, &plan.plan_id, &home, &renamer, &mut log).unwrap();
+
+        assert_eq!(renamer.calls(), 0, "{}", spelling.display());
+        assert!(
+            matches!(report.skipped[0].reason, SkipMove::NotCanonical),
+            "{:?}",
+            report.skipped
+        );
+    }
+}
+
+/// A cargo project the builtin caution rule admits: marker, `CACHEDIR.TAG`, build lock.
+fn cargo_project(root: &Path) -> (PathBuf, Entry) {
+    let project = root.join("crate");
+    let target = project.join("target");
+    fs::create_dir_all(target.join("debug")).expect("fixture directories can be created");
+    fs::write(project.join("Cargo.toml"), b"[package]").expect("marker can be written");
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .expect("tag can be written");
+    fs::write(target.join("debug/.cargo-lock"), b"").expect("lock file can be written");
+
+    let entry = Entry {
+        rule: "cargo-target".to_owned(),
+        tier: Tier::Caution,
+        ..entry_at(&target, true, Some(project.join("Cargo.toml")))
+    };
+    (project, entry)
+}
+
+fn apply_one(entry: Entry, home: &Path) -> (usize, ApplyReport) {
+    let plan = Plan::from_entries(vec![entry], "host", now());
+    let renamer = Recorded(Mutex::new(Vec::new()));
+    let mut log = MemoryLog::default();
+    let report = apply_real(&plan, &plan.plan_id, home, &renamer, &mut log)
+        .expect("the confirm string is the plan id");
+    (renamer.calls(), report)
+}
+
+#[test]
+fn caution_entry_needs_its_marker_and_the_tool_file_on_disk() {
+    let fixture = TempDir::new("admit");
+    let home = fixture.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let (project, entry) = cargo_project(fixture.path());
+
+    let (calls, report) = apply_one(entry.clone(), &home);
+    assert_eq!(calls, 1, "{:?}", report.skipped);
+
+    fs::remove_file(project.join("target/CACHEDIR.TAG")).unwrap();
+    let (calls, report) = apply_one(entry_like(&entry), &home);
+    assert_eq!(calls, 0);
+    assert!(matches!(report.skipped[0].reason, SkipMove::Rule));
+
+    fs::write(project.join("target/CACHEDIR.TAG"), b"Signature").unwrap();
+    fs::remove_file(project.join("Cargo.toml")).unwrap();
+    let (calls, report) = apply_one(entry_like(&entry), &home);
+    assert_eq!(calls, 0);
+    assert!(matches!(report.skipped[0].reason, SkipMove::Rule));
+}
+
+/// The same claim with the identity the directory has now.
+fn entry_like(entry: &Entry) -> Entry {
+    let fresh = entry_at(&entry.path, true, entry.marker.clone());
+    Entry {
+        rule: entry.rule.clone(),
+        tier: entry.tier,
+        ..fresh
+    }
+}
+
+#[test]
+fn a_running_cargo_build_holds_the_target() {
+    let fixture = TempDir::new("buildlock");
+    let home = fixture.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let (project, entry) = cargo_project(fixture.path());
+
+    // Cargo locks the file under `debug/`, never the directory.
+    let mut child = std::process::Command::new("perl")
+        .arg("-e")
+        .arg(
+            "use Fcntl qw(:flock); open my $fh, '<', $ARGV[0] or die $!; \
+             flock($fh, LOCK_EX | LOCK_NB) or die $!; $| = 1; print \"locked\\n\"; sleep 60;",
+        )
+        .arg(project.join("target/debug/.cargo-lock"))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("perl is on macOS");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut line).unwrap();
+    assert_eq!(line, "locked\n", "perl did not take the lock");
+
+    let (calls, report) = apply_one(entry, &home);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(calls, 0);
+    assert!(
+        matches!(report.skipped[0].reason, SkipMove::Locked),
+        "{:?}",
+        report.skipped
+    );
+}
+
+#[test]
+fn restore_and_purge_leave_a_reused_trash_name_alone() {
+    let fixture = TempDir::new("reused");
+    let home = fixture.path().join("home");
+    let quarantine = fixture.path().join("vol/.disk-health-quarantine/plan");
+    fs::create_dir_all(home.join(".Trash")).unwrap();
+    fs::create_dir_all(&quarantine).unwrap();
+
+    // Each line was written for some other tree. The trash was emptied and
+    // a later plan put a different one at the same name.
+    let mut log = MemoryLog::default();
+    let mut ids = Vec::new();
+    for name in [home.join(".Trash/0-target"), quarantine.join("0-target")] {
+        fs::write(&name, b"first").unwrap();
+        let action = Action {
+            from: home.join("a/target"),
+            ..logged(&name, now() - Duration::from_hours(8 * 24))
+        }
+        .stamp();
+        fs::remove_file(&name).unwrap();
+        fs::create_dir(&name).unwrap();
+        fs::write(name.join("b-build"), b"second").unwrap();
+        log.append(&action).unwrap();
+        ids.push(action.id);
+    }
+
+    let err = restore(&RestoreRequest {
+        id: &ids[0],
+        home: &home,
+        uid: 501,
+        log: &log,
+        renamer: &FsRename,
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("no longer holds"), "{err}");
+    assert!(!home.join("a/target").exists());
+
+    let report = purge(&PurgeRequest {
+        log: &log,
+        now: now(),
+    })
+    .unwrap();
+    assert_eq!(report.removed, Vec::<PathBuf>::new());
+    assert!(quarantine.join("0-target/b-build").exists());
+}
+
+#[test]
+fn install_inside_a_pruned_directory_is_not_a_project() {
+    let fixture = TempDir::new("nested");
+    let home = fixture.path().join("home");
+    let inner = fixture.path().join("app/node_modules/pkg");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(inner.join("node_modules")).unwrap();
+    fs::write(inner.join("package.json"), b"{}").unwrap();
+    fs::write(inner.join("yarn.lock"), b"").unwrap();
+
+    let entry = Entry {
+        rule: "node-modules".to_owned(),
+        tier: Tier::Caution,
+        ..entry_at(
+            &inner.join("node_modules"),
+            true,
+            Some(inner.join("yarn.lock")),
+        )
+    };
+    let (calls, report) = apply_one(entry, &home);
+    assert_eq!(calls, 0);
+    assert!(matches!(report.skipped[0].reason, SkipMove::Rule));
+}
+
+#[test]
+fn purge_keeps_a_path_that_was_quarantined_again() {
+    let fixture = TempDir::new("requarantine");
+    let quarantine = fixture
+        .path()
+        .join("vol")
+        .join(".disk-health-quarantine")
+        .join("plan");
+    fs::create_dir_all(&quarantine).unwrap();
+    let again = quarantine.join("0-cache");
+    fs::write(&again, b"moved a minute ago").unwrap();
+
+    // Moved eight days ago, restored, and moved to the same place just now.
+    let mut log = MemoryLog::default();
+    log.append(&logged(&again, now() - Duration::from_hours(8 * 24)))
+        .unwrap();
+    log.append(&logged(&again, now() - Duration::from_mins(1)))
+        .unwrap();
+
+    let report = purge(&PurgeRequest {
+        log: &log,
+        now: now(),
+    })
+    .unwrap();
+    assert_eq!(report.removed, Vec::<PathBuf>::new());
+    assert_eq!(fs::read(&again).unwrap(), b"moved a minute ago");
+}
+
+/// A log line for a move that put the object now at `path` there.
 fn logged(path: &Path, at: SystemTime) -> Action {
+    let meta = RealFs.meta(path).expect("the logged destination exists");
     Action {
         id: String::new(),
         plan_id: "plan".to_owned(),
         rule: "fixture".to_owned(),
         from: PathBuf::from("/cache"),
         to: path.to_path_buf(),
-        dev: 1,
-        ino: 2,
+        dev: meta.dev,
+        ino: meta.ino,
         apparent_bytes: 4,
         at,
     }
