@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 publish = false
-description = "Scan macOS for regenerable caches and cold build outputs"
+description = "Scan macOS caches and cold build output, then trash only a confirmed plan"
 
 [dependencies]
 

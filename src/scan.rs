@@ -2,8 +2,8 @@
 //!
 //! The scan is read-only. It does not create, rename, or remove anything.
 //! A finding is staged only when every gate for its tier passed. Review paths
-//! (sessions, worktrees, editor snapshots) are not rules, so they cannot appear
-//! here at all.
+//! are not findings. [`crate::review`] owns that inventory, and [`Report::review`]
+//! starts empty so a scan cannot smuggle those rows into a plan.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -100,6 +100,8 @@ pub struct Report {
     pub roots_missing: Vec<PathBuf>,
     /// Requested project roots that sit on the denylist.
     pub roots_denied: Vec<PathBuf>,
+    /// Review inventory. Empty until the caller fills it. Not part of a plan.
+    pub review: Vec<crate::review::Item>,
 }
 
 impl Report {
@@ -119,6 +121,7 @@ impl Report {
     ///     dirs_visited: 0,
     ///     roots_missing: Vec::new(),
     ///     roots_denied: Vec::new(),
+    ///     review: Vec::new(),
     /// };
     /// assert_eq!(report.safe_staged_bytes(), 0);
     /// ```
@@ -151,6 +154,11 @@ pub struct ScanOptions<'a> {
     pub fs: &'a dyn Fs,
     /// Called with the number of project directories visited so far.
     pub progress: Option<&'a (dyn Fn(u64) + Sync)>,
+    /// Called with each finding before it is stored. May run on a worker thread.
+    ///
+    /// The callback receives a borrow. It must copy anything it keeps: the
+    /// scan reuses no buffer, but the reference does not outlive the call.
+    pub on_finding: Option<&'a (dyn Fn(&Finding) + Sync)>,
 }
 
 impl std::fmt::Debug for ScanOptions<'_> {
@@ -200,6 +208,7 @@ impl std::fmt::Debug for ScanOptions<'_> {
 ///     git: &git,
 ///     fs: &fs,
 ///     progress: None,
+///     on_finding: None,
 /// })
 /// .unwrap();
 /// assert!(report.findings.is_empty());
@@ -224,6 +233,7 @@ pub fn scan(opts: &ScanOptions<'_>) -> Result<Report> {
         dirs_visited: chunk.dirs_visited,
         roots_missing: chunk.roots_missing,
         roots_denied: chunk.roots_denied,
+        review: Vec::new(),
     })
 }
 
@@ -622,7 +632,7 @@ fn consider_known(
         });
     }
 
-    chunk.findings.push(Finding {
+    let finding = Finding {
         rule: candidate.rule,
         tier: candidate.tier,
         path: candidate.path.to_path_buf(),
@@ -635,7 +645,11 @@ fn consider_known(
         marker: candidate.marker,
         skip,
         rationale: candidate.rationale,
-    });
+    };
+    if let Some(notify) = opts.on_finding {
+        notify(&finding);
+    }
+    chunk.findings.push(finding);
 }
 
 #[derive(Clone, Copy)]

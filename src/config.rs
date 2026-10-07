@@ -195,13 +195,27 @@ pub fn deny_prefixes(home: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
 ///
 /// let deny = deny_prefixes(Path::new("/Users/ada"), &[]);
 /// assert!(path_is_denied(Path::new("/usr/bin"), &deny));
+/// assert!(path_is_denied(Path::new("/Volumes/Source/.Trashes/501"), &deny));
 /// assert!(!path_is_denied(Path::new("/Users/ada/code"), &deny));
 /// ```
 #[must_use]
 pub fn path_is_denied(path: &Path, prefixes: &[PathBuf]) -> bool {
     let path = normalize(path);
+    if path.components().any(|component| {
+        let name = component.as_os_str();
+        DENY_COMPONENTS.iter().any(|denied| name == *denied)
+    }) {
+        return true;
+    }
+
     prefixes.iter().any(|prefix| path.starts_with(prefix))
 }
+
+/// Directory names that are never candidates, on any volume.
+///
+/// Trash and the quarantine directory hold bytes we already decided to
+/// remove. A rule, or an edited plan, must not be able to name them again.
+const DENY_COMPONENTS: &[&str] = &[".Trash", ".Trashes", ".disk-health-quarantine"];
 
 /// Drops `.` and resolves `..` without touching the filesystem.
 ///

@@ -51,6 +51,7 @@ fn run(
         git,
         fs,
         progress: None,
+        on_finding: None,
     })
     .expect("a scan worker can be spawned")
 }
@@ -137,6 +138,7 @@ fn symlink_node_modules_is_not_a_candidate() {
         git: &git,
         fs: &fs,
         progress: None,
+        on_finding: None,
     })
     .expect("a scan worker can be spawned");
 
@@ -386,6 +388,7 @@ fn real_flock_skips_the_directory() {
         git: &git,
         fs: &fs,
         progress: None,
+        on_finding: None,
     })
     .expect("a scan worker can be spawned");
 
@@ -576,6 +579,7 @@ fn scan_fixture(home: &Path) -> Report {
         git: &git,
         fs: &fs,
         progress: None,
+        on_finding: None,
     })
     .expect("a scan worker can be spawned")
 }
