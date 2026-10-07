@@ -324,7 +324,9 @@ pub fn write_frame(fd: i32, frame: &str) -> io::Result<()> {
 ///
 /// Returns an error when `read` fails for a reason other than interruption.
 pub fn read_input(fd: i32) -> io::Result<Option<Vec<u8>>> {
-    let mut buf = [0u8; 8];
+    // A held key repeats faster than the UI reads, and a pasted total is
+    // several bytes. Both have to arrive whole.
+    let mut buf = [0u8; 64];
     let read = sys::read_fd(fd, &mut buf)?;
     if read == 0 {
         Ok(None)

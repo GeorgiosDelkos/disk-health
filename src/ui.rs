@@ -1,25 +1,37 @@
 //! Three screens over the scan, the review inventory, and one usage tree.
 //!
 //! Each screen leads with a bar. Volumes show used and free. Reclaim shows
-//! how the measured bytes split across safe, caution, and review. Usage shows
-//! each child as a share of its parent. [`Palette::Plain`] draws those bars
-//! with block characters and no color.
+//! how the measured bytes split across safe, caution, and review, then one
+//! line per row under its tier. Usage shows each child as a share of its
+//! parent. [`Palette::Plain`] draws those bars with block characters and no
+//! color, and is what `NO_COLOR` selects.
 //!
 //! [`Model::handle`] is a pure function of a key. Tests drive it without a
 //! terminal. The only mutation it can ask for is [`Effect::ConfirmApply`],
 //! and the caller fulfills that by [`crate::trash::apply_typed_total`].
-//! Space changes a caution row. It does not change a safe row or a review row.
-//! The usage screen has no stage key.
+//! Space changes a caution row that is staged or held only for its age. It
+//! does not change a safe row, a review row, or a caution row held for any
+//! other reason. The usage screen has no stage key.
+//!
+//! The scan, the review inventory, a usage walk, and an apply each run on
+//! their own thread and report over one channel. The UI thread never waits
+//! on the disk, so it can always paint and always quit. Quitting during an
+//! apply stops it between entries and waits for its report.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime};
 
+use crate::config::Loaded;
 use crate::plan::{Entry, Plan};
 use crate::report::format_bytes;
 use crate::review::Item;
-use crate::rules::Tier;
+use crate::rules::{Skip, Tier};
 use crate::scan::Finding;
 use crate::time::unix_nanos;
+use crate::trash::ApplyReport;
 use crate::usage::UsageNode;
 use crate::volumes::Volume;
 use crate::walk::Fs;
@@ -59,6 +71,24 @@ pub enum Key {
     Backspace,
     /// Escape, with no following bracket sequence.
     Escape,
+    /// Tab.
+    Tab,
+    /// Arrow up.
+    Up,
+    /// Arrow down.
+    Down,
+    /// Arrow left.
+    Left,
+    /// Arrow right.
+    Right,
+    /// Page up.
+    PageUp,
+    /// Page down.
+    PageDown,
+    /// Home.
+    Home,
+    /// End.
+    End,
 }
 
 /// What the caller should do after a key.
@@ -81,6 +111,9 @@ pub enum Effect {
         /// Mount point.
         mount: PathBuf,
     },
+    /// Quit was pressed while an apply is running. The caller stops the
+    /// apply after its current entry and leaves once it has reported.
+    Interrupt,
 }
 
 /// Reclaim filter. `f` cycles it. The footer names the key.
@@ -97,32 +130,79 @@ pub enum Filter {
     Review,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a finished scan went, for the title and the status line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanSummary {
+    /// Entries the scan could not read.
+    pub unreadable: u64,
+    /// Project roots that do not exist.
+    pub roots_missing: usize,
+    /// Project roots on the denylist.
+    pub roots_denied: usize,
+    /// Why the scan stopped early, when it did.
+    pub failed: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanState {
+    Running,
+    Done,
+}
+
+/// Work running off the UI thread. The status line shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Busy {
+    Walking { mount: PathBuf },
+    Applying,
+}
+
+/// Order of the reclaim groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RowKind {
     Safe,
     Caution,
     Review,
 }
 
+/// What keys mean right now. One at a time, so a help screen cannot sit on
+/// top of a half-typed total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Toggle {
-    /// Space does nothing.
-    Fixed,
-    /// Space flips [`Row::staged`].
-    Caution,
+enum Mode {
+    /// Keys move and act on the current screen.
+    Browse,
+    /// Keys are typed into the confirm prompt.
+    Confirm,
+    /// The key list is showing. Any key closes it.
+    Help,
+}
+
+/// Order of the children on the usage screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Order {
+    Size,
+    Name,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Motion {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
     kind: RowKind,
-    word: &'static str,
     rule: String,
     path: PathBuf,
     bytes: u64,
     age: Option<Duration>,
-    regenerate: Option<String>,
     staged: bool,
-    toggle: Toggle,
+    /// Why the last apply left this row in place.
+    skipped: Option<String>,
     detail: String,
     finding: Option<Finding>,
 }
@@ -133,23 +213,35 @@ pub struct Model {
     screen: Screen,
     palette: Palette,
     columns: usize,
-    volumes: Vec<Volume>,
-    rows: Vec<Row>,
-    usage: Option<UsageNode>,
-    now: SystemTime,
-    cursor: usize,
-    volume_cursor: usize,
-    usage_cursor: usize,
-    usage_path: Vec<usize>,
-    filter: Filter,
-    detail: bool,
-    confirming: bool,
-    typed: String,
-    message: String,
-    sort_by_size: bool,
     /// Terminal height. The list scrolls inside what this leaves after the
     /// title and the footer.
     term_rows: usize,
+    /// Shown as `~` in paths, when known.
+    home: Option<PathBuf>,
+    now: SystemTime,
+
+    volumes: Vec<Volume>,
+    volume_cursor: usize,
+    /// Whether mounts that cannot be walked are listed.
+    all_volumes: bool,
+
+    rows: Vec<Row>,
+    cursor: usize,
+    filter: Filter,
+    detail: bool,
+    typed: String,
+    scan: ScanState,
+    scan_dirs: u64,
+
+    usage: Option<UsageNode>,
+    usage_cursor: usize,
+    usage_path: Vec<usize>,
+    order: Order,
+    walk_dirs: u64,
+
+    busy: Option<Busy>,
+    mode: Mode,
+    message: String,
     /// Bumped on every change the screen shows. The driver skips a paint
     /// when this still matches the frame it drew.
     revision: u64,
@@ -187,23 +279,34 @@ impl Model {
             screen: Screen::Volumes,
             palette,
             columns: 80,
-            volumes,
-            rows,
-            usage: None,
+            term_rows: 40,
+            home: None,
             now,
-            cursor: 0,
+            volumes,
             volume_cursor: 0,
-            usage_cursor: 0,
-            usage_path: Vec::new(),
+            all_volumes: false,
+            rows,
+            cursor: 0,
             filter: Filter::All,
             detail: false,
-            confirming: false,
             typed: String::new(),
+            scan: ScanState::Running,
+            scan_dirs: 0,
+            usage: None,
+            usage_cursor: 0,
+            usage_path: Vec::new(),
+            order: Order::Size,
+            walk_dirs: 0,
+            busy: None,
+            mode: Mode::Browse,
             message: String::new(),
-            sort_by_size: true,
-            term_rows: 40,
             revision: 1,
         }
+    }
+
+    fn say(&mut self, text: &str) {
+        self.message.clear();
+        self.message.push_str(text);
     }
 
     fn bump(&mut self) {
@@ -212,9 +315,10 @@ impl Model {
 
     /// Applies one key.
     ///
-    /// `q` quits while a total is being typed. `1`, `2`, and `3` are
-    /// characters during confirm: the printed total contains those digits,
-    /// and treating them as screen changes would drop the prompt.
+    /// `q` quits while a total is being typed. Every other key is a
+    /// character during confirm: the printed total contains `1`, `2`, and
+    /// `3`, and treating them as screen changes would drop the prompt.
+    /// While an apply is running the only key is `q`, which asks it to stop.
     ///
     /// # Examples
     ///
@@ -227,13 +331,31 @@ impl Model {
     /// ```
     pub fn handle(&mut self, key: Key) -> Effect {
         self.bump();
+        if self.applying() {
+            return self.handle_applying(key);
+        }
+        // A status line answers the key before it. The next key starts clean.
+        self.message.clear();
         if key == Key::Char('q') {
             return Effect::Quit;
         }
-        if self.confirming && self.screen == Screen::Reclaim {
-            return self.handle_confirm(key);
+        match self.mode {
+            Mode::Help => {
+                self.mode = Mode::Browse;
+                return Effect::None;
+            }
+            Mode::Confirm => return self.handle_confirm(key),
+            Mode::Browse => {}
+        }
+        if key == Key::Char('?') {
+            self.mode = Mode::Help;
+            return Effect::None;
         }
         if self.switch_screen(key) {
+            return Effect::None;
+        }
+        if let Some(motion) = motion(key) {
+            self.move_cursor(motion);
             return Effect::None;
         }
 
@@ -275,14 +397,111 @@ impl Model {
         self.bump();
     }
 
+    /// Records how far the scan's project walk has come.
+    pub fn set_scan_progress(&mut self, dirs: u64) {
+        if self.scan_dirs != dirs {
+            self.scan_dirs = dirs;
+            self.bump();
+        }
+    }
+
+    /// Marks the scan finished and reports what it could not do.
+    pub fn finish_scan(&mut self, summary: &ScanSummary) {
+        self.scan = ScanState::Done;
+        if let Some(note) = scan_note(summary) {
+            self.message = note;
+        }
+        self.bump();
+    }
+
+    /// Notes that a usage walk of `mount` is running elsewhere.
+    pub fn begin_walk(&mut self, mount: PathBuf) {
+        self.message.clear();
+        self.busy = Some(Busy::Walking { mount });
+        self.walk_dirs = 0;
+        self.bump();
+    }
+
+    /// Records how many directories the usage walk has expanded.
+    pub fn set_walk_progress(&mut self, dirs: u64) {
+        if self.walk_dirs != dirs && matches!(self.busy, Some(Busy::Walking { .. })) {
+            self.walk_dirs = dirs;
+            self.bump();
+        }
+    }
+
     /// Shows a usage tree and switches to that screen.
     pub fn set_usage(&mut self, node: UsageNode) {
+        self.end_walk();
         self.usage = Some(node);
         self.usage_path.clear();
         self.usage_cursor = 0;
         self.screen = Screen::Usage;
         self.sort_current();
         self.bump();
+    }
+
+    /// Reports a usage walk that did not produce a tree.
+    pub fn fail_walk(&mut self, message: impl Into<String>) {
+        self.end_walk();
+        self.set_message(message);
+    }
+
+    fn end_walk(&mut self) {
+        if matches!(self.busy, Some(Busy::Walking { .. })) {
+            self.busy = None;
+        }
+    }
+
+    /// Notes that an apply is running elsewhere. Keys other than `q` wait.
+    pub fn begin_apply(&mut self) {
+        self.busy = Some(Busy::Applying);
+        self.message.clear();
+        self.mode = Mode::Browse;
+        self.typed.clear();
+        self.bump();
+    }
+
+    /// Whether an apply is running. The caller must not quit while it is.
+    #[must_use]
+    pub fn applying(&self) -> bool {
+        self.busy == Some(Busy::Applying)
+    }
+
+    /// Takes moved rows off the list and marks the ones that stayed.
+    ///
+    /// A row that was skipped is no longer staged, so the total in the title
+    /// is again what a confirm would move.
+    pub fn finish_apply(&mut self, report: &ApplyReport) {
+        let anchor = self.anchor();
+        let mut bytes: u64 = 0;
+        self.rows.retain(|row| {
+            let moved =
+                row.finding.is_some() && report.moved.iter().any(|item| item.from == row.path);
+            if moved {
+                bytes = bytes.saturating_add(row.bytes);
+            }
+            !moved
+        });
+        for skipped in &report.skipped {
+            for row in &mut self.rows {
+                if row.finding.is_some() && row.path == skipped.path {
+                    row.staged = false;
+                    row.skipped = Some(skipped.reason.to_string());
+                }
+            }
+        }
+
+        self.busy = None;
+        self.restore_anchor(anchor);
+        self.message = apply_note(report, bytes);
+        self.bump();
+    }
+
+    /// Reports an apply that returned an error. Nothing was renamed.
+    pub fn fail_apply(&mut self, message: impl Into<String>) {
+        self.busy = None;
+        self.set_message(message);
     }
 
     /// Sets the render width. A resize redraws from this snapshot.
@@ -294,6 +513,12 @@ impl Model {
     /// Sets the render height. A resize redraws from this snapshot.
     pub fn set_rows(&mut self, rows: usize) {
         self.term_rows = rows.max(1);
+        self.bump();
+    }
+
+    /// Sets the directory shown as `~` in paths.
+    pub fn set_home(&mut self, home: &Path) {
+        self.home = Some(home.to_path_buf());
         self.bump();
     }
 
@@ -339,37 +564,83 @@ impl Model {
             .fold(0, |sum, row| sum.saturating_add(row.bytes))
     }
 
+    fn handle_applying(&mut self, key: Key) -> Effect {
+        if key == Key::Char('q') {
+            self.say("stopping after the current entry");
+            return Effect::Interrupt;
+        }
+        Effect::None
+    }
+
     fn switch_screen(&mut self, key: Key) -> bool {
-        let Some(screen) = screen_key(key) else {
-            return false;
+        let screen = match key {
+            Key::Char('1') => Screen::Volumes,
+            Key::Char('2') => Screen::Reclaim,
+            Key::Char('3') => Screen::Usage,
+            Key::Tab => self.screen.next(),
+            _ => return false,
         };
         self.screen = screen;
-        self.confirming = false;
-        self.typed.clear();
         true
+    }
+
+    fn move_cursor(&mut self, motion: Motion) {
+        match self.screen {
+            Screen::Volumes => {
+                self.volume_cursor = moved(self.volume_cursor, motion, self.shown_volumes().len());
+            }
+            Screen::Reclaim => self.cursor = moved(self.cursor, motion, self.visible().len()),
+            Screen::Usage => {
+                self.usage_cursor = moved(self.usage_cursor, motion, self.child_count());
+            }
+        }
     }
 
     fn handle_volumes(&mut self, key: Key) -> Effect {
         match key {
-            Key::Char('j') => {
-                self.volume_cursor = step(self.volume_cursor, 1, self.volumes.len());
+            Key::Char('u') | Key::Enter => self.walk_selected(),
+            Key::Char('a') => {
+                self.toggle_all_volumes();
                 Effect::None
             }
-            Key::Char('k') => {
-                self.volume_cursor = step(self.volume_cursor, -1, self.volumes.len());
-                Effect::None
-            }
-            Key::Char('u') => self.walk_selected(),
             _ => Effect::None,
         }
     }
 
+    fn toggle_all_volumes(&mut self) {
+        let selected = self.shown_volumes().get(self.volume_cursor).copied();
+        self.all_volumes = !self.all_volumes;
+        let shown = self.shown_volumes();
+        self.volume_cursor = selected
+            .and_then(|index| shown.iter().position(|shown| *shown == index))
+            .unwrap_or(0);
+    }
+
+    /// Indexes of the mounts on screen. A mount that cannot be walked is
+    /// noise until someone asks for all of them.
+    fn shown_volumes(&self) -> Vec<usize> {
+        self.volumes
+            .iter()
+            .enumerate()
+            .filter(|(_, volume)| self.all_volumes || volume.walkable)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     fn walk_selected(&mut self) -> Effect {
-        let Some(volume) = self.volumes.get(self.volume_cursor) else {
+        let shown = self.shown_volumes();
+        let Some(volume) = shown
+            .get(self.volume_cursor)
+            .map(|index| &self.volumes[*index])
+        else {
             return Effect::None;
         };
         if !volume.walkable {
             self.message = format!("not walkable: {}", volume.mount.display());
+            return Effect::None;
+        }
+        if let Some(Busy::Walking { mount }) = &self.busy {
+            self.message = format!("still walking {}", mount.display());
             return Effect::None;
         }
         Effect::WalkUsage {
@@ -379,116 +650,99 @@ impl Model {
 
     fn handle_reclaim(&mut self, key: Key) -> Effect {
         match key {
-            Key::Char('j') => {
-                self.cursor = step(self.cursor, 1, self.visible().len());
-                Effect::None
-            }
-            Key::Char('k') => {
-                self.cursor = step(self.cursor, -1, self.visible().len());
-                Effect::None
-            }
-            Key::Char(' ') => {
-                self.toggle_selected();
-                Effect::None
-            }
-            Key::Char('d') => {
-                self.detail = !self.detail;
-                Effect::None
-            }
-            Key::Char('t') => {
-                self.begin_confirm();
-                Effect::None
-            }
+            Key::Char(' ') => self.toggle_selected(),
+            Key::Char('d') => self.detail = !self.detail,
+            Key::Char('t') => self.begin_confirm(),
             Key::Char('f') => {
+                let anchor = self.anchor();
                 self.filter = self.filter.next();
-                self.clamp_reclaim();
-                Effect::None
+                self.restore_anchor(anchor);
             }
-            _ => Effect::None,
+            _ => {}
         }
+        Effect::None
     }
 
     fn toggle_selected(&mut self) {
         let Some(index) = self.selected_row() else {
             return;
         };
-        if self.rows[index].toggle != Toggle::Caution {
+        if let Some(refusal) = toggle_refusal(&self.rows[index]) {
+            self.message = refusal;
             return;
         }
-        self.rows[index].staged = !self.rows[index].staged;
+        let row = &mut self.rows[index];
+        row.staged = !row.staged;
+        row.skipped = None;
     }
 
     fn begin_confirm(&mut self) {
-        self.confirming = true;
+        if !self.rows.iter().any(|row| row.staged) {
+            self.say("nothing is staged");
+            return;
+        }
+        self.mode = Mode::Confirm;
         self.typed.clear();
-        let total = format_bytes(self.staged_bytes());
-        self.message = format!("type {total} and press enter");
     }
 
     fn handle_confirm(&mut self, key: Key) -> Effect {
         match key {
-            Key::Enter => self.finish_confirm(),
+            Key::Enter => return self.finish_confirm(),
             Key::Backspace => {
                 self.typed.pop();
-                Effect::None
             }
             Key::Escape => {
-                self.confirming = false;
+                self.mode = Mode::Browse;
                 self.typed.clear();
-                Effect::None
             }
-            Key::Char(ch) => {
-                self.typed.push(ch);
-                Effect::None
-            }
+            Key::Char(ch) => self.typed.push(ch),
+            _ => {}
         }
+        Effect::None
     }
 
     fn finish_confirm(&mut self) -> Effect {
         let expected = format_bytes(self.staged_bytes());
         if self.typed == expected {
-            self.confirming = false;
+            self.mode = Mode::Browse;
             Effect::ConfirmApply { typed: expected }
         } else {
-            self.message = format!("type {expected} to confirm");
+            self.say("does not match; type the total, or esc to cancel");
             Effect::None
         }
     }
 
     fn handle_usage(&mut self, key: Key) -> Effect {
         match key {
-            Key::Char('j') => {
-                self.usage_cursor = step(self.usage_cursor, 1, self.child_count());
-                Effect::None
-            }
-            Key::Char('k') => {
-                self.usage_cursor = step(self.usage_cursor, -1, self.child_count());
-                Effect::None
-            }
             Key::Char('s') => {
-                self.sort_by_size = !self.sort_by_size;
+                self.order = match self.order {
+                    Order::Size => Order::Name,
+                    Order::Name => Order::Size,
+                };
                 self.sort_current();
-                Effect::None
             }
-            Key::Enter => {
-                self.descend();
-                Effect::None
-            }
-            Key::Backspace => {
-                self.ascend();
-                Effect::None
-            }
-            _ => Effect::None,
+            Key::Enter | Key::Right | Key::Char('l') => self.descend(),
+            Key::Backspace | Key::Left | Key::Char('h') | Key::Escape => self.ascend(),
+            _ => {}
         }
+        Effect::None
     }
 
     fn descend(&mut self) {
-        let count = self.child_count();
-        if count == 0 || self.usage_cursor >= count {
+        let Some(child) = node_at(self.usage.as_ref(), &self.usage_path)
+            .and_then(|node| node.children.get(self.usage_cursor))
+        else {
+            return;
+        };
+        // A file, an empty directory, or a directory below the depth the
+        // walk expanded. Entering it would show an empty screen.
+        if child.children.is_empty() {
+            self.message = format!("nothing listed below {}", file_label(&child.path));
             return;
         }
         self.usage_path.push(self.usage_cursor);
         self.usage_cursor = 0;
+        self.sort_current();
     }
 
     fn ascend(&mut self) {
@@ -498,18 +752,19 @@ impl Model {
     }
 
     fn sort_current(&mut self) {
-        let by_size = self.sort_by_size;
+        let order = self.order;
         let path = self.usage_path.clone();
         let Some(node) = node_at_mut(self.usage.as_mut(), &path) else {
             return;
         };
-        sort_children(node, by_size);
+        sort_children(node, order);
     }
 
     fn child_count(&self) -> usize {
         node_at(self.usage.as_ref(), &self.usage_path).map_or(0, |node| node.children.len())
     }
 
+    /// Row indexes in screen order: by tier, then largest first.
     fn visible(&self) -> Vec<usize> {
         let mut indexes = self
             .rows
@@ -519,13 +774,13 @@ impl Model {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
 
-        // Largest allocation first, so the bar the eye meets is the heavy one.
         indexes.sort_by(|&left, &right| {
-            self.rows[right]
-                .bytes
-                .cmp(&self.rows[left].bytes)
-                .then(self.rows[left].path.cmp(&self.rows[right].path))
-                .then(self.rows[left].rule.cmp(&self.rows[right].rule))
+            let (left, right) = (&self.rows[left], &self.rows[right]);
+            left.kind
+                .cmp(&right.kind)
+                .then(right.bytes.cmp(&left.bytes))
+                .then(left.path.cmp(&right.path))
+                .then(left.rule.cmp(&right.rule))
         });
         indexes
     }
@@ -565,6 +820,15 @@ impl Model {
     }
 }
 
+impl Screen {
+    const fn next(self) -> Self {
+        match self {
+            Self::Volumes => Self::Reclaim,
+            Self::Reclaim => Self::Usage,
+            Self::Usage => Self::Volumes,
+        }
+    }
+}
 impl Filter {
     fn next(self) -> Self {
         match self {
@@ -596,40 +860,45 @@ impl Filter {
 
 /// Why the TUI should not start.
 ///
-/// `NO_COLOR`, `TERM=dumb`, and a captured stdout all name `scan --format text`.
+/// `TERM=dumb` and a captured stdout both name `scan --format text`.
+/// `NO_COLOR` is not a reason: it selects [`Palette::Plain`].
 ///
 /// # Examples
 ///
 /// ```
 /// use disk_health::ui::refuse;
 ///
-/// let message = refuse(false, Some("dumb"), true).unwrap();
+/// let message = refuse(false, Some("dumb")).unwrap();
 /// assert!(message.contains("scan --format text"));
-/// assert!(refuse(true, Some("xterm-256color"), false).is_none());
+/// assert!(refuse(true, Some("xterm-256color")).is_none());
 /// ```
 #[must_use]
-pub fn refuse(tty: bool, term: Option<&str>, no_color: bool) -> Option<&'static str> {
-    if !tty || term == Some("dumb") || no_color {
+pub fn refuse(tty: bool, term: Option<&str>) -> Option<&'static str> {
+    if !tty || term == Some("dumb") {
         Some("the terminal cannot draw the tui; run scan --format text")
     } else {
         None
     }
 }
 
-/// Picks a palette from `COLORTERM`, then from `TERM`.
+/// Picks a palette from `NO_COLOR`, then `COLORTERM`, then `TERM`.
 ///
 /// # Examples
 ///
 /// ```
 /// use disk_health::ui::{Palette, palette_from};
 ///
-/// assert_eq!(palette_from(Some("truecolor"), None), Palette::True);
-/// assert_eq!(palette_from(None, None), Palette::Ansi16);
-/// assert_eq!(palette_from(Some("256"), None), Palette::Ansi256);
-/// assert_eq!(palette_from(None, Some("xterm-256color")), Palette::Ansi256);
+/// assert_eq!(palette_from(Some("truecolor"), None, false), Palette::True);
+/// assert_eq!(palette_from(None, None, false), Palette::Ansi16);
+/// assert_eq!(palette_from(Some("256"), None, false), Palette::Ansi256);
+/// assert_eq!(palette_from(None, Some("xterm-256color"), false), Palette::Ansi256);
+/// assert_eq!(palette_from(Some("truecolor"), None, true), Palette::Plain);
 /// ```
 #[must_use]
-pub fn palette_from(colorterm: Option<&str>, term: Option<&str>) -> Palette {
+pub fn palette_from(colorterm: Option<&str>, term: Option<&str>, no_color: bool) -> Palette {
+    if no_color {
+        return Palette::Plain;
+    }
     if matches!(colorterm, Some("truecolor" | "24bit")) {
         return Palette::True;
     }
@@ -647,31 +916,74 @@ fn term_has_256(term: &str) -> bool {
     term.contains("256color") || term.contains("truecolor")
 }
 
-/// Decodes one read burst. Arrow keys are `j` and `k`.
+/// Decodes one read burst into the keys it holds, in order.
+///
+/// A held key or a pasted total arrives as several keys in one read. An
+/// escape sequence this does not know is dropped whole, so its tail is not
+/// typed into the confirm prompt.
 ///
 /// # Examples
 ///
 /// ```
 /// use disk_health::ui::{Key, decode};
 ///
-/// assert_eq!(decode(b"q"), Some(Key::Char('q')));
-/// assert_eq!(decode(&[0x1b, b'[', b'A']), Some(Key::Char('k')));
-/// assert_eq!(decode(b"\r"), Some(Key::Enter));
+/// assert_eq!(decode(b"q"), [Key::Char('q')]);
+/// assert_eq!(decode(b"jj\x1b[B\r"), [Key::Char('j'), Key::Char('j'), Key::Down, Key::Enter]);
+/// assert_eq!(decode(&[0x1b]), [Key::Escape]);
 /// ```
 #[must_use]
-pub fn decode(bytes: &[u8]) -> Option<Key> {
-    match bytes {
-        [0x1b, b'[', b'A'] => Some(Key::Char('k')),
-        [0x1b, b'[', b'B'] => Some(Key::Char('j')),
-        [0x1b] => Some(Key::Escape),
-        [0x7f | 0x08] => Some(Key::Backspace),
-        [b'\r' | b'\n'] => Some(Key::Enter),
-        [byte] if byte.is_ascii() && !byte.is_ascii_control() => Some(Key::Char(char::from(*byte))),
-        _ => None,
+pub fn decode(bytes: &[u8]) -> Vec<Key> {
+    let mut keys = Vec::new();
+    let mut rest = bytes;
+    while let Some((&first, tail)) = rest.split_first() {
+        rest = tail;
+        let key = match first {
+            0x1b if matches!(rest.first(), Some(b'[' | b'O')) => {
+                let (key, after) = escape_sequence(&rest[1..]);
+                rest = after;
+                key
+            }
+            0x1b => Some(Key::Escape),
+            0x7f | 0x08 => Some(Key::Backspace),
+            b'\r' | b'\n' => Some(Key::Enter),
+            b'\t' => Some(Key::Tab),
+            byte if byte.is_ascii() && !byte.is_ascii_control() => {
+                Some(Key::Char(char::from(byte)))
+            }
+            _ => None,
+        };
+        keys.extend(key);
     }
+    keys
 }
 
-/// Renders `model` to a string.
+/// Reads the parameters and final byte after `ESC [` or `ESC O`.
+fn escape_sequence(bytes: &[u8]) -> (Option<Key>, &[u8]) {
+    // ECMA-48: parameter and intermediate bytes are 0x20..=0x3f, and one
+    // final byte in 0x40..=0x7e ends the sequence.
+    let params = bytes
+        .iter()
+        .take_while(|byte| (0x20..=0x3f).contains(*byte))
+        .count();
+    let Some(last) = bytes.get(params) else {
+        return (None, &[]);
+    };
+
+    let key = match (&bytes[..params], *last) {
+        (b"", b'A') => Some(Key::Up),
+        (b"", b'B') => Some(Key::Down),
+        (b"", b'C') => Some(Key::Right),
+        (b"", b'D') => Some(Key::Left),
+        (b"", b'H') | (b"1" | b"7", b'~') => Some(Key::Home),
+        (b"", b'F') | (b"4" | b"8", b'~') => Some(Key::End),
+        (b"5", b'~') => Some(Key::PageUp),
+        (b"6", b'~') => Some(Key::PageDown),
+        _ => None,
+    };
+    (key, &bytes[params + 1..])
+}
+
+/// Renders `model` to a string, at most as many lines as the terminal has.
 ///
 /// [`Palette::Plain`] has tier words, block bars, and no escapes.
 ///
@@ -683,25 +995,25 @@ pub fn decode(bytes: &[u8]) -> Option<Key> {
 ///
 /// let model = Model::new(Vec::new(), Vec::new(), Vec::new(), Palette::Plain, UNIX_EPOCH);
 /// let frame = render(&model);
-/// assert!(frame.contains("f filter"));
+/// assert!(frame.contains("? help"));
 /// assert!(frame.contains('─'));
 /// assert!(!frame.contains('\u{1b}'));
 /// ```
 #[must_use]
 pub fn render(model: &Model) -> String {
     let mut head = vec![title_line(model), rule_line(model)];
-    head.extend(allocation_lines(model));
-
-    let (body, focus) = match model.screen {
-        Screen::Volumes => volume_body(model),
-        Screen::Reclaim => reclaim_body(model),
-        Screen::Usage => usage_body(model),
+    let (body, focus) = if model.mode == Mode::Help {
+        (help_body(model), 0)
+    } else {
+        head.extend(allocation_lines(model));
+        match model.screen {
+            Screen::Volumes => volume_body(model),
+            Screen::Reclaim => reclaim_body(model),
+            Screen::Usage => usage_body(model),
+        }
     };
-    let mut foot = vec![String::new()];
-    foot.extend(footer_lines(model));
-    if let Some(message) = message_line(model) {
-        foot.push(message);
-    }
+    let mut foot = vec![String::new(), footer_line(model)];
+    foot.extend(message_line(model));
 
     let budget = model
         .term_rows
@@ -710,6 +1022,9 @@ pub fn render(model: &Model) -> String {
     let mut lines = head;
     lines.extend(viewport(body, focus, budget));
     lines.extend(foot);
+    // A terminal shorter than the title and footer still gets a frame that
+    // fits. One line too many scrolls the whole screen.
+    lines.truncate(model.term_rows);
     lines.join("\n")
 }
 
@@ -719,9 +1034,9 @@ pub fn render(model: &Model) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Usage`] when stdout is not a terminal, `TERM` is
-/// `dumb`, or `NO_COLOR` is set. Later errors are a failed mount table,
-/// config file, or terminal mode.
+/// Returns [`crate::Error::Usage`] when stdout is not a terminal or `TERM`
+/// is `dumb`. Later errors are a failed mount table, config file, or
+/// terminal mode.
 ///
 /// # Examples
 ///
@@ -740,7 +1055,7 @@ pub fn render(model: &Model) -> String {
 /// assert!(err.to_string().contains("scan --format text"));
 /// ```
 pub fn run(session: &Session<'_>) -> crate::Result<i32> {
-    if let Some(message) = refuse(session.tty, session.term, session.no_color) {
+    if let Some(message) = refuse(session.tty, session.term) {
         return Err(crate::Error::Usage {
             message: message.to_owned(),
         });
@@ -756,7 +1071,7 @@ pub struct Session<'a> {
     pub tty: bool,
     /// `TERM`, when set.
     pub term: Option<&'a str>,
-    /// `NO_COLOR` was present.
+    /// `NO_COLOR` was present. The UI draws without color.
     pub no_color: bool,
     /// `COLORTERM`, when set.
     pub colorterm: Option<&'a str>,
@@ -764,11 +1079,32 @@ pub struct Session<'a> {
     pub home: &'a Path,
 }
 
+/// What a background thread hands back to the UI thread.
+enum Event {
+    Finding(Finding),
+    ScanDone(ScanSummary),
+    Review(Vec<Item>),
+    Usage(std::result::Result<UsageNode, String>),
+    Applied(std::result::Result<ApplyReport, String>),
+}
+
+/// Everything slow runs on a thread started here. The UI thread only reads
+/// keys, takes events, and paints, so `q` always answers.
+struct Background {
+    home: PathBuf,
+    loaded: Arc<Loaded>,
+    events: mpsc::Sender<Event>,
+    scan_dirs: Arc<AtomicU64>,
+    walk_dirs: Arc<AtomicU64>,
+}
+
 fn drive(session: &Session<'_>) -> crate::Result<i32> {
     let loaded = crate::config::load(session.home)?;
+    let (roots, denied) = crate::config::prepare_roots(&loaded.roots, &loaded.deny)?;
     let volumes = crate::volumes::list_mounts()?;
-    let palette = palette_from(session.colorterm, session.term);
+    let palette = palette_from(session.colorterm, session.term, session.no_color);
     let mut model = Model::new(volumes, Vec::new(), Vec::new(), palette, SystemTime::now());
+    model.set_home(session.home);
     if let Ok((rows, cols)) = crate::tty::window_size(0) {
         model.set_columns(usize::from(cols));
         model.set_rows(usize::from(rows));
@@ -779,20 +1115,29 @@ fn drive(session: &Session<'_>) -> crate::Result<i32> {
     let _panic = crate::tty::PanicGuard::install(0, 1, raw.previous());
     let _signals = crate::tty::Signals::install_with_resize()
         .map_err(|source| crate::Error::io("install signals", "/dev/tty", source))?;
-    let (finding_tx, finding_rx) = std::sync::mpsc::channel();
-    let (review_tx, review_rx) = std::sync::mpsc::channel();
+
+    let (events, inbox) = mpsc::channel();
+    let background = Background {
+        home: session.home.to_path_buf(),
+        loaded: Arc::new(loaded),
+        events,
+        scan_dirs: Arc::new(AtomicU64::new(0)),
+        walk_dirs: Arc::new(AtomicU64::new(0)),
+    };
     // Detached on purpose. Quitting must not wait for a walk of a large volume.
-    let _scan = spawn_scan(session.home, loaded.clone(), finding_tx);
-    let _review = spawn_review(session.home.to_path_buf(), review_tx);
+    background.spawn_scan(roots, denied.len());
+    background.spawn_review();
 
     // `read_input` times out ten times a second. Painting an unchanged
     // frame at that rate flickers, so the revision has to move first.
     let mut drawn = 0;
     loop {
-        if crate::tty::interrupted() {
-            break;
+        // An apply is told to stop by the same flag and reports back. Leaving
+        // before it does would drop the rows it skipped.
+        if crate::tty::interrupted() && !model.applying() {
+            return Ok(0);
         }
-        drain(&mut model, &finding_rx, &review_rx);
+        background.deliver(&mut model, &inbox);
         if crate::tty::take_resized()
             && let Ok((rows, cols)) = crate::tty::window_size(0)
         {
@@ -803,165 +1148,224 @@ fn drive(session: &Session<'_>) -> crate::Result<i32> {
             paint_frame(&model)?;
             drawn = model.revision;
         }
+
         let Some(bytes) = crate::tty::read_input(0)
             .map_err(|source| crate::Error::io("read key", "/dev/tty", source))?
         else {
             continue;
         };
-        let Some(key) = decode(&bytes) else {
-            continue;
-        };
-        if apply_key(&mut model, session, &loaded, key)? {
-            break;
+        for key in decode(&bytes) {
+            if background.act(&mut model, key) {
+                return Ok(0);
+            }
         }
     }
-    Ok(0)
 }
 
 fn paint_frame(model: &Model) -> crate::Result<()> {
-    let frame = render(model);
-    let mut painted = String::new();
-
-    // Erase the rest of each line and everything below the frame. The
-    // previous frame is not cleared by cursor-home alone, so a shorter
-    // list would leave the old rows on screen.
-    for line in frame.split('\n') {
-        painted.push_str(line);
-        painted.push_str("\u{1b}[K\r\n");
-    }
-    painted.push_str("\u{1b}[J");
-
-    crate::tty::write_frame(1, &painted)
+    crate::tty::write_frame(1, &frame_bytes(model))
         .map_err(|source| crate::Error::io("draw", "/dev/tty", source))
 }
 
-fn drain(
-    model: &mut Model,
-    findings: &std::sync::mpsc::Receiver<Finding>,
-    review: &std::sync::mpsc::Receiver<Vec<Item>>,
-) {
-    while let Ok(finding) = findings.try_recv() {
-        model.push_finding(finding);
-    }
-    if let Ok(items) = review.try_recv() {
-        model.set_review(items);
-    }
+/// The frame as terminal output, after the cursor is homed.
+///
+/// Each line erases to its end, and everything below the frame is erased,
+/// so a shorter frame leaves nothing of the previous one. Lines are joined,
+/// not terminated: a newline after the last row of a full screen scrolls it
+/// and the title is gone.
+fn frame_bytes(model: &Model) -> String {
+    let mut painted = render(model).replace('\n', "\u{1b}[K\r\n");
+    painted.push_str("\u{1b}[K\u{1b}[J");
+    painted
 }
 
-fn apply_key(
-    model: &mut Model,
-    session: &Session<'_>,
-    loaded: &crate::config::Loaded,
-    key: Key,
-) -> crate::Result<bool> {
-    match model.handle(key) {
-        Effect::Quit => Ok(true),
-        Effect::None => Ok(false),
-        Effect::WalkUsage { mount } => {
-            match crate::usage::walk(
+impl Background {
+    fn deliver(&self, model: &mut Model, inbox: &mpsc::Receiver<Event>) {
+        while let Ok(event) = inbox.try_recv() {
+            match event {
+                Event::Finding(finding) => model.push_finding(finding),
+                Event::ScanDone(summary) => model.finish_scan(&summary),
+                Event::Review(items) => model.set_review(items),
+                Event::Usage(Ok(tree)) => model.set_usage(tree),
+                Event::Usage(Err(message)) => model.fail_walk(message),
+                Event::Applied(Ok(report)) => model.finish_apply(&report),
+                Event::Applied(Err(message)) => model.fail_apply(message),
+            }
+        }
+        // `Relaxed`: these are counters for the status line and publish nothing else.
+        model.set_scan_progress(self.scan_dirs.load(Ordering::Relaxed));
+        model.set_walk_progress(self.walk_dirs.load(Ordering::Relaxed));
+    }
+
+    /// Applies one key. `true` means leave.
+    fn act(&self, model: &mut Model, key: Key) -> bool {
+        match model.handle(key) {
+            Effect::Quit => return true,
+            Effect::None => {}
+            Effect::Interrupt => {
+                crate::tty::interrupt_flag().store(true, Ordering::Release);
+            }
+            Effect::WalkUsage { mount } => {
+                model.begin_walk(mount.clone());
+                self.spawn_walk(mount);
+            }
+            Effect::ConfirmApply { typed } => {
+                // Typed size, not the plan id. `apply` would reject this path.
+                let plan = model.plan(&hostname());
+                model.begin_apply();
+                self.spawn_apply(plan, typed);
+            }
+        }
+        false
+    }
+
+    fn spawn_scan(&self, roots: Vec<PathBuf>, denied: usize) {
+        let home = self.home.clone();
+        let loaded = Arc::clone(&self.loaded);
+        let events = self.events.clone();
+        let dirs = Arc::clone(&self.scan_dirs);
+        std::thread::spawn(move || {
+            let found = events.clone();
+            let notify = move |finding: &Finding| {
+                let _ = found.send(Event::Finding(finding.clone()));
+            };
+            let progress = move |visited: u64| dirs.store(visited, Ordering::Relaxed);
+            let report = crate::scan::scan(&crate::scan::ScanOptions {
+                home: &home,
+                roots: &roots,
+                safe_rules: &loaded.safe_rules,
+                project_rules: &loaded.project_rules,
+                deny: &loaded.deny,
+                now: SystemTime::now(),
+                git: &crate::git::SystemGit,
+                fs: &crate::walk::RealFs,
+                progress: Some(&progress),
+                on_finding: Some(&notify),
+            });
+            let summary = match report {
+                Ok(report) => ScanSummary {
+                    unreadable: report.unreadable,
+                    roots_missing: report.roots_missing.len(),
+                    roots_denied: report.roots_denied.len() + denied,
+                    failed: None,
+                },
+                Err(err) => ScanSummary {
+                    failed: Some(err.to_string()),
+                    ..ScanSummary::default()
+                },
+            };
+            let _ = events.send(Event::ScanDone(summary));
+        });
+    }
+
+    fn spawn_review(&self) {
+        let home = self.home.clone();
+        let events = self.events.clone();
+        std::thread::spawn(move || {
+            let settings_path = home.join(".rustup/settings.toml");
+            let settings = std::fs::read_to_string(settings_path).ok();
+            let rows = crate::review::inventory(
+                &crate::walk::RealFs,
+                &home,
+                SystemTime::now(),
+                &crate::git::SystemWorktree,
+                settings.as_deref(),
+            );
+            let _ = events.send(Event::Review(rows));
+        });
+    }
+
+    fn spawn_walk(&self, mount: PathBuf) {
+        let events = self.events.clone();
+        let dirs = Arc::clone(&self.walk_dirs);
+        dirs.store(0, Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let progress = move |expanded: u64| dirs.store(expanded, Ordering::Relaxed);
+            let tree = crate::usage::walk(
                 &crate::walk::RealFs,
                 &mount,
                 crate::usage::DEFAULT_DEPTH,
-                None,
-            ) {
-                Ok(tree) => model.set_usage(tree),
-                Err(err) => model.set_message(err.to_string()),
-            }
-            Ok(false)
-        }
-        Effect::ConfirmApply { typed } => {
-            // Typed size, not the plan id. `apply` would reject this path.
-            confirm(model, session, loaded, &typed)?;
-            Ok(false)
-        }
+                Some(&progress),
+            );
+            let _ = events.send(Event::Usage(tree.map_err(|err| err.to_string())));
+        });
+    }
+
+    fn spawn_apply(&self, plan: Plan, typed: String) {
+        let home = self.home.clone();
+        let loaded = Arc::clone(&self.loaded);
+        let events = self.events.clone();
+        std::thread::spawn(move || {
+            let report = apply_plan(&home, &loaded, &plan, &typed);
+            let _ = events.send(Event::Applied(report.map_err(|err| err.to_string())));
+        });
     }
 }
 
-fn confirm(
-    model: &mut Model,
-    session: &Session<'_>,
-    loaded: &crate::config::Loaded,
+fn apply_plan(
+    home: &Path,
+    loaded: &Loaded,
+    plan: &Plan,
     typed: &str,
-) -> crate::Result<()> {
-    let plan = model.plan(&hostname());
+) -> crate::Result<ApplyReport> {
     let filesystem = crate::walk::RealFs;
-    let home_meta = filesystem.meta(session.home)?;
-    let mut log = crate::log::FileLog::new(action_log(session.home));
-    let renamer = crate::trash::FsRename;
-    let report = crate::trash::apply_typed_total(
+    let home_meta = filesystem.meta(home)?;
+    let mut log = crate::log::FileLog::new(action_log(home));
+    crate::trash::apply_typed_total(
         crate::trash::ApplyRequest {
-            plan: &plan,
+            plan,
             confirm: "",
-            home: session.home,
+            home,
             home_dev: home_meta.dev,
             uid: crate::volumes::current_uid(),
             deny: &loaded.deny,
             safe_rules: &loaded.safe_rules,
             project_rules: &loaded.project_rules,
             fs: &filesystem,
-            renamer: &renamer,
+            renamer: &crate::trash::FsRename,
             log: &mut log,
             now: SystemTime::now(),
             interrupt: Some(crate::tty::interrupt_flag()),
         },
         typed,
-    )?;
-    model.set_message(apply_message(&report));
-    Ok(())
-}
-
-fn apply_message(report: &crate::trash::ApplyReport) -> String {
-    format!(
-        "moved {}  skipped {}  exit {}",
-        report.moved.len(),
-        report.skipped.len(),
-        report.exit_code()
     )
 }
 
-fn spawn_scan(
-    home: &Path,
-    loaded: crate::config::Loaded,
-    tx: std::sync::mpsc::Sender<Finding>,
-) -> std::thread::JoinHandle<()> {
-    let home = home.to_path_buf();
-    std::thread::spawn(move || {
-        let git = crate::git::SystemGit;
-        let filesystem = crate::walk::RealFs;
-        let notify = move |finding: &Finding| {
-            let _ = tx.send(finding.clone());
-        };
-        let _ = crate::scan::scan(&crate::scan::ScanOptions {
-            home: &home,
-            roots: &loaded.roots,
-            safe_rules: &loaded.safe_rules,
-            project_rules: &loaded.project_rules,
-            deny: &loaded.deny,
-            now: SystemTime::now(),
-            git: &git,
-            fs: &filesystem,
-            progress: None,
-            on_finding: Some(&notify),
-        });
-    })
+fn apply_note(report: &ApplyReport, moved_bytes: u64) -> String {
+    let unlogged = report.moved.iter().filter(|item| !item.logged).count();
+    let mut note = format!(
+        "moved {} ({})  skipped {}",
+        report.moved.len(),
+        format_bytes(moved_bytes),
+        report.skipped.len()
+    );
+    if unlogged > 0 {
+        // Writing to a `String` cannot fail.
+        let _ = write!(note, "  {unlogged} not logged, restore by hand");
+    }
+    note
 }
 
-fn spawn_review(
-    home: PathBuf,
-    tx: std::sync::mpsc::Sender<Vec<Item>>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let settings_path = home.join(".rustup/settings.toml");
-        let settings = std::fs::read_to_string(settings_path).ok();
-        let rows = crate::review::inventory(
-            &crate::walk::RealFs,
-            &home,
-            SystemTime::now(),
-            &crate::git::SystemWorktree,
-            settings.as_deref(),
-        );
-        let _ = tx.send(rows);
-    })
+fn scan_note(summary: &ScanSummary) -> Option<String> {
+    if let Some(failed) = &summary.failed {
+        return Some(format!("scan failed: {failed}"));
+    }
+
+    let mut parts = Vec::new();
+    if summary.unreadable > 0 {
+        parts.push(format!("{} unreadable", summary.unreadable));
+    }
+    if summary.roots_missing > 0 {
+        parts.push(format!("{} roots missing", summary.roots_missing));
+    }
+    if summary.roots_denied > 0 {
+        parts.push(format!("{} roots denied", summary.roots_denied));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("scan done: {}", parts.join(", ")))
+    }
 }
 
 fn action_log(home: &Path) -> PathBuf {
@@ -985,39 +1389,50 @@ fn hostname() -> String {
     }
 }
 
-fn screen_key(key: Key) -> Option<Screen> {
+fn motion(key: Key) -> Option<Motion> {
     match key {
-        Key::Char('1') => Some(Screen::Volumes),
-        Key::Char('2') => Some(Screen::Reclaim),
-        Key::Char('3') => Some(Screen::Usage),
+        Key::Char('j') | Key::Down => Some(Motion::Down),
+        Key::Char('k') | Key::Up => Some(Motion::Up),
+        Key::PageDown => Some(Motion::PageDown),
+        Key::PageUp => Some(Motion::PageUp),
+        Key::Char('g') | Key::Home => Some(Motion::Top),
+        Key::Char('G') | Key::End => Some(Motion::Bottom),
         _ => None,
     }
 }
 
+/// Rows a page key moves.
+const PAGE: usize = 10;
+
+fn moved(cursor: usize, motion: Motion, len: usize) -> usize {
+    let last = len.saturating_sub(1);
+    match motion {
+        Motion::Up => cursor.saturating_sub(1),
+        Motion::Down => cursor.saturating_add(1).min(last),
+        Motion::PageUp => cursor.saturating_sub(PAGE),
+        Motion::PageDown => cursor.saturating_add(PAGE).min(last),
+        Motion::Top => 0,
+        Motion::Bottom => last,
+    }
+}
+
 fn row_from_finding(finding: Finding, now: SystemTime) -> Row {
-    let (kind, word) = match finding.tier {
-        Tier::Safe => (RowKind::Safe, "SAFE"),
-        Tier::Caution => (RowKind::Caution, "CAUTION"),
-    };
-    let toggle = match finding.tier {
-        Tier::Caution => Toggle::Caution,
-        Tier::Safe => Toggle::Fixed,
+    let kind = match finding.tier {
+        Tier::Safe => RowKind::Safe,
+        Tier::Caution => RowKind::Caution,
     };
     let age = finding
         .mtime
         .and_then(|mtime| now.duration_since(mtime).ok());
-    let detail = finding_detail(&finding);
     Row {
         kind,
-        word,
         rule: finding.rule.to_owned(),
         path: finding.path.clone(),
         bytes: finding.apparent_bytes,
         age,
-        regenerate: finding.regenerate.map(str::to_owned),
         staged: finding.staged(),
-        toggle,
-        detail,
+        skipped: None,
+        detail: finding_detail(&finding),
         finding: Some(finding),
     }
 }
@@ -1025,8 +1440,12 @@ fn row_from_finding(finding: Finding, now: SystemTime) -> Row {
 fn finding_detail(finding: &Finding) -> String {
     let mut detail = finding.rationale.to_owned();
     if let Some(skip) = finding.skip {
-        detail.push_str("  skip: ");
+        detail.push_str("  held: ");
         detail.push_str(skip.as_str());
+    }
+    if let Some(regenerate) = finding.regenerate {
+        detail.push_str("  refill: ");
+        detail.push_str(regenerate);
     }
     if let Some(marker) = &finding.marker {
         detail.push_str("  marker: ");
@@ -1047,14 +1466,12 @@ fn row_from_review(item: Item) -> Row {
     }
     Row {
         kind: RowKind::Review,
-        word: "REVIEW",
         rule: item.class.as_str().to_owned(),
         path: item.path,
         bytes: item.apparent_bytes,
         age: item.age,
-        regenerate: item.advice,
         staged: false,
-        toggle: Toggle::Fixed,
+        skipped: None,
         detail,
         finding: None,
     }
@@ -1077,18 +1494,57 @@ fn entry_of(row: &Row) -> Option<Entry> {
     })
 }
 
-fn step(cursor: usize, delta: isize, len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    let next = isize::try_from(cursor).unwrap_or(0) + delta;
-    if next <= 0 {
-        0
-    } else {
-        usize::try_from(next).unwrap_or(len - 1).min(len - 1)
+/// Why space leaves this row alone. `None` means it may be flipped.
+///
+/// The only gate an operator may override is age. A lock, a dirty tree, or
+/// a tree the scan could not read all mean the scan does not know the row
+/// is safe to move, and apply does not check git again.
+fn toggle_refusal(row: &Row) -> Option<String> {
+    let finding = match (row.kind, &row.finding) {
+        (RowKind::Caution, Some(finding)) => finding,
+        (RowKind::Safe, _) => return Some("safe rows follow the scan".to_owned()),
+        (RowKind::Review | RowKind::Caution, _) => {
+            return Some("review rows are never staged".to_owned());
+        }
+    };
+    match finding.skip {
+        None | Some(Skip::Young) => None,
+        Some(skip) => Some(format!("held: {}", skip.as_str())),
     }
 }
 
+/// The few words of [`Skip`] that fit in a row.
+const fn skip_label(skip: Skip) -> &'static str {
+    match skip {
+        Skip::Hot => "hot",
+        Skip::Young => "young",
+        Skip::Future => "future mtime",
+        Skip::Locked => "locked",
+        Skip::LockUnknown => "lock unknown",
+        Skip::Dirty => "git dirty",
+        Skip::GitUnknown => "git unknown",
+        Skip::NestedGit => "nested git",
+        Skip::CrossedDevice => "mount inside",
+        Skip::UnknownAge => "no mtime",
+        Skip::Partial => "unreadable",
+    }
+}
+
+fn state_text(row: &Row) -> String {
+    if row.kind == RowKind::Review {
+        return "review".to_owned();
+    }
+    if row.staged {
+        return "staged".to_owned();
+    }
+    if let Some(reason) = &row.skipped {
+        return format!("skipped: {reason}");
+    }
+    match row.finding.as_ref().and_then(|finding| finding.skip) {
+        Some(skip) => format!("held: {}", skip_label(skip)),
+        None => "held".to_owned(),
+    }
+}
 fn node_at<'a>(root: Option<&'a UsageNode>, path: &[usize]) -> Option<&'a UsageNode> {
     let mut node = root?;
     for index in path {
@@ -1105,17 +1561,17 @@ fn node_at_mut<'a>(root: Option<&'a mut UsageNode>, path: &[usize]) -> Option<&'
     Some(node)
 }
 
-fn sort_children(node: &mut UsageNode, by_size: bool) {
-    if by_size {
-        node.children.sort_by(|left, right| {
+fn sort_children(node: &mut UsageNode, order: Order) {
+    match order {
+        Order::Size => node.children.sort_by(|left, right| {
             right
                 .apparent_bytes
                 .cmp(&left.apparent_bytes)
                 .then(left.path.cmp(&right.path))
-        });
-    } else {
-        node.children
-            .sort_by(|left, right| left.path.cmp(&right.path));
+        }),
+        Order::Name => node
+            .children
+            .sort_by(|left, right| left.path.cmp(&right.path)),
     }
 }
 
@@ -1151,30 +1607,6 @@ const SLICE_256: [u8; 8] = [43, 75, 141, 215, 204, 149, 110, 209];
 const SLICE_16: [u8; 8] = [36, 34, 35, 33, 31, 32, 37, 36];
 const SLICE_BG16: [u8; 8] = [46, 44, 45, 43, 41, 42, 47, 46];
 const PLAIN_GLYPHS: [char; 5] = ['█', '▓', '▒', '░', '·'];
-
-fn title_line(model: &Model) -> String {
-    let name = match model.screen {
-        Screen::Volumes => "volumes",
-        Screen::Reclaim => "reclaim",
-        Screen::Usage => "usage",
-    };
-    let left = format!("disk-health  {name}");
-    let right = format!("staged {}", format_bytes(model.staged_bytes()));
-    let gap = " ".repeat(gap_width(
-        model.columns,
-        left.chars().count() + right.chars().count(),
-    ));
-
-    paint_line(
-        model.palette,
-        &[
-            (left.as_str(), Ink::Title),
-            (gap.as_str(), Ink::Text),
-            (right.as_str(), Ink::Safe),
-        ],
-        model.columns,
-    )
-}
 
 fn rule_line(model: &Model) -> String {
     let text = "─".repeat(model.columns.max(1));
@@ -1258,25 +1690,6 @@ fn tier_bar(model: &Model, totals: &TierTotals, total: u64) -> String {
     )
 }
 
-fn volume_body(model: &Model) -> (Vec<String>, usize) {
-    if model.volumes.is_empty() {
-        return (vec!["  no mounts".to_owned()], 0);
-    }
-
-    let mut lines = Vec::new();
-    let mut focus = 0;
-    for (index, volume) in model.volumes.iter().enumerate() {
-        if index == model.volume_cursor {
-            focus = lines.len();
-        }
-        if index > 0 {
-            lines.push(String::new());
-        }
-        lines.extend(volume_card(model, volume, index == model.volume_cursor));
-    }
-    (lines, focus)
-}
-
 fn volume_card(model: &Model, volume: &Volume, selected: bool) -> Vec<String> {
     let pct = percent(volume.used_bytes, volume.total_bytes);
     let heat = heat_ink(pct);
@@ -1325,94 +1738,6 @@ fn volume_meter(model: &Model, volume: &Volume, heat: Ink) -> String {
     let width = guide_width(model.columns);
     let filled = magnitude(volume.used_bytes, volume.total_bytes, width);
     meter(model.palette, filled, width, heat, '█')
-}
-
-fn reclaim_body(model: &Model) -> (Vec<String>, usize) {
-    let visible = model.visible();
-    if visible.is_empty() {
-        return (vec!["  no reclaim rows yet".to_owned()], 0);
-    }
-
-    let total = visible.iter().fold(0u64, |sum, index| {
-        sum.saturating_add(model.rows[*index].bytes)
-    });
-    let mut lines = Vec::new();
-    let mut focus = 0;
-    for (shown, index) in visible.into_iter().enumerate() {
-        if shown == model.cursor {
-            focus = lines.len();
-        }
-        if shown > 0 {
-            lines.push(String::new());
-        }
-        let selected = shown == model.cursor;
-        lines.extend(reclaim_card(model, &model.rows[index], selected, total));
-    }
-    (lines, focus)
-}
-
-fn reclaim_card(model: &Model, row: &Row, selected: bool, total: u64) -> Vec<String> {
-    let mut lines = vec![reclaim_heading(model, row, selected, total)];
-    lines.push(indent_meter(&reclaim_meter(model, row, total)));
-
-    let path = short_tail(&row.path, model.columns.saturating_sub(4));
-    lines.push(paint_line(
-        model.palette,
-        &[("    ", Ink::Text), (path.as_str(), Ink::Muted)],
-        model.columns,
-    ));
-    if selected && model.detail {
-        lines.push(paint_line(
-            model.palette,
-            &[("    ", Ink::Text), (row.detail.as_str(), Ink::Muted)],
-            model.columns,
-        ));
-    }
-    lines
-}
-
-fn reclaim_heading(model: &Model, row: &Row, selected: bool, total: u64) -> String {
-    let marker = if selected { "▸ " } else { "  " };
-    let marker_ink = if selected { Ink::Accent } else { Ink::Muted };
-    let word = format!("{:<7}", row.word);
-    let state = if row.staged { "staged" } else { "held" };
-    let meta = format!(
-        "  {:>9}  {:<6}  {:>6}  {}",
-        format_bytes(row.bytes),
-        state,
-        age_text(row.age),
-        row.rule,
-    );
-    let share = pct_text(row.bytes, total);
-    let used = marker.chars().count()
-        + word.chars().count()
-        + meta.chars().count()
-        + share.chars().count();
-    let gap = " ".repeat(gap_width(model.columns, used));
-
-    paint_line(
-        model.palette,
-        &[
-            (marker, marker_ink),
-            (word.as_str(), tier_ink(row.kind)),
-            (meta.as_str(), Ink::Text),
-            (gap.as_str(), Ink::Text),
-            (share.as_str(), tier_ink(row.kind)),
-        ],
-        model.columns,
-    )
-}
-
-fn reclaim_meter(model: &Model, row: &Row, total: u64) -> String {
-    let width = guide_width(model.columns);
-    let filled = magnitude(row.bytes, total, width);
-    meter(
-        model.palette,
-        filled,
-        width,
-        tier_ink(row.kind),
-        tier_glyph(row.kind),
-    )
 }
 
 fn usage_body(model: &Model) -> (Vec<String>, usize) {
@@ -1528,38 +1853,334 @@ fn usage_child(
     vec![heading, bar]
 }
 
-fn footer_lines(model: &Model) -> Vec<String> {
-    let filter = model.filter.as_str();
-    let first = format!("1 volumes  2 reclaim  3 usage  f filter ({filter})  q quit");
-    let second = "j/k move   space caution   d detail   t confirm   u walk   s sort";
+fn title_line(model: &Model) -> String {
+    let name = match model.screen {
+        Screen::Volumes => "volumes",
+        Screen::Reclaim => "reclaim",
+        Screen::Usage => "usage",
+    };
+    let left = format!("disk-health  {name}");
+    let scan = match (&model.busy, &model.scan) {
+        (Some(Busy::Walking { mount }), _) => {
+            format!("walking {}  {} dirs", mount.display(), model.walk_dirs)
+        }
+        (_, ScanState::Running) => format!("scanning  {} dirs", model.scan_dirs),
+        (_, ScanState::Done) => "scan done".to_owned(),
+    };
+    let staged = format!("   staged {}", format_bytes(model.staged_bytes()));
+    let used = left.chars().count() + scan.chars().count() + staged.chars().count();
+    let gap = " ".repeat(gap_width(model.columns, used));
 
-    vec![
-        paint_line(model.palette, &[(&first, Ink::Muted)], model.columns),
-        paint_line(model.palette, &[(second, Ink::Muted)], model.columns),
-    ]
+    paint_line(
+        model.palette,
+        &[
+            (left.as_str(), Ink::Title),
+            (gap.as_str(), Ink::Text),
+            (scan.as_str(), Ink::Muted),
+            (staged.as_str(), Ink::Safe),
+        ],
+        model.columns,
+    )
+}
+
+fn help_body(model: &Model) -> Vec<String> {
+    const LINES: &[&str] = &[
+        "",
+        "  everywhere",
+        "    1 2 3, tab     switch screen",
+        "    j k, arrows    move          g G, home end   first, last",
+        "    page up, down  move a page   q               quit",
+        "",
+        "  volumes",
+        "    u, enter       walk the selected volume into the usage screen",
+        "    a              also list mounts that cannot be walked",
+        "",
+        "  reclaim",
+        "    space          stage or hold a caution row (only age can be overridden)",
+        "    d              show the full path, the rule's reason, and the marker",
+        "    f              filter by tier",
+        "    t              type the staged total to move those rows to the trash",
+        "",
+        "  usage",
+        "    enter, right   open a directory   backspace, left   go up",
+        "    s              sort by size or by name",
+        "",
+        "  any key closes this",
+    ];
+    LINES
+        .iter()
+        .map(|line| paint_line(model.palette, &[(line, Ink::Text)], model.columns))
+        .collect()
+}
+
+fn volume_body(model: &Model) -> (Vec<String>, usize) {
+    let shown = model.shown_volumes();
+    if shown.is_empty() {
+        return (vec!["  no walkable mounts; press a for all".to_owned()], 0);
+    }
+
+    let mut lines = Vec::new();
+    let mut focus = 0;
+    for (position, index) in shown.into_iter().enumerate() {
+        let selected = position == model.volume_cursor;
+        if position > 0 {
+            lines.push(String::new());
+        }
+        if selected {
+            focus = lines.len();
+        }
+        lines.extend(volume_card(model, &model.volumes[index], selected));
+    }
+    (lines, focus)
+}
+
+fn reclaim_body(model: &Model) -> (Vec<String>, usize) {
+    let visible = model.visible();
+    if visible.is_empty() {
+        let text = match model.scan {
+            ScanState::Running => "  no reclaim rows yet",
+            ScanState::Done => "  nothing to reclaim",
+        };
+        return (vec![text.to_owned()], 0);
+    }
+
+    let total = visible.iter().fold(0u64, |sum, index| {
+        sum.saturating_add(model.rows[*index].bytes)
+    });
+    let mut lines = Vec::new();
+    let mut focus = 0;
+    let mut group = None;
+    for (position, index) in visible.iter().enumerate() {
+        let row = &model.rows[*index];
+        if group != Some(row.kind) {
+            if group.is_some() {
+                lines.push(String::new());
+            }
+            lines.push(group_heading(model, row.kind, &visible));
+            group = Some(row.kind);
+        }
+
+        let selected = position == model.cursor;
+        if selected {
+            focus = lines.len();
+        }
+        lines.push(reclaim_line(model, row, selected, total));
+        if selected && model.detail {
+            lines.extend(detail_lines(model, row));
+        }
+    }
+    (lines, focus)
+}
+
+/// One line per tier: how many rows, how much, and how much of it is staged.
+fn group_heading(model: &Model, kind: RowKind, visible: &[usize]) -> String {
+    let rows = visible
+        .iter()
+        .map(|index| &model.rows[*index])
+        .filter(|row| row.kind == kind);
+    let (mut count, mut bytes, mut staged) = (0usize, 0u64, 0u64);
+    for row in rows {
+        count += 1;
+        bytes = bytes.saturating_add(row.bytes);
+        if row.staged {
+            staged = staged.saturating_add(row.bytes);
+        }
+    }
+
+    let word = format!("  {:<8}", tier_word(kind));
+    let noun = if count == 1 { "row" } else { "rows" };
+    let mut summary = format!("{count} {noun}  {}", format_bytes(bytes));
+    if kind != RowKind::Review {
+        // Writing to a `String` cannot fail.
+        let _ = write!(summary, "  staged {}", format_bytes(staged));
+    }
+    paint_line(
+        model.palette,
+        &[
+            (word.as_str(), tier_ink(kind)),
+            (summary.as_str(), Ink::Muted),
+        ],
+        model.columns,
+    )
+}
+
+/// Cells in a reclaim row's bar.
+const ROW_BAR: usize = 10;
+/// Narrower than this, a row drops its bar and keeps the path.
+const ROW_BAR_MIN_COLUMNS: usize = 72;
+/// Narrower than this, a row drops the rule id, which `d` still shows.
+const ROW_RULE_MIN_COLUMNS: usize = 100;
+
+fn reclaim_line(model: &Model, row: &Row, selected: bool, total: u64) -> String {
+    let marker = if selected { "▸ " } else { "  " };
+    let marker_ink = if selected { Ink::Accent } else { Ink::Muted };
+    let size = format!("{:>9} ", format_bytes(row.bytes));
+    let size_ink = if selected { Ink::Title } else { Ink::Text };
+    let mut line = paint_line(
+        model.palette,
+        &[(marker, marker_ink), (size.as_str(), size_ink)],
+        model.columns,
+    );
+    let mut used = marker.chars().count() + size.chars().count();
+
+    if model.columns >= ROW_BAR_MIN_COLUMNS {
+        let filled = magnitude(row.bytes, total, ROW_BAR);
+        line.push_str(&meter(
+            model.palette,
+            filled,
+            ROW_BAR,
+            tier_ink(row.kind),
+            tier_glyph(row.kind),
+        ));
+        used += ROW_BAR;
+    }
+
+    let state = format!(" {:<18}", state_text(row));
+    let state_ink = if row.staged {
+        tier_ink(row.kind)
+    } else {
+        Ink::Muted
+    };
+    let facts = if model.columns >= ROW_RULE_MIN_COLUMNS {
+        format!("{:>5}  {:<16} ", age_text(row.age), row.rule)
+    } else {
+        format!("{:>5}  ", age_text(row.age))
+    };
+    let left = model.columns.saturating_sub(used);
+    let taken = state.chars().count() + facts.chars().count();
+    let path = short_tail(&shown_path(model, &row.path), left.saturating_sub(taken));
+    line.push_str(&paint_line(
+        model.palette,
+        &[
+            (state.as_str(), state_ink),
+            (facts.as_str(), Ink::Text),
+            (path.as_str(), Ink::Muted),
+        ],
+        left,
+    ));
+    line
+}
+
+/// The full path and the rule's reasons, wrapped so neither is cut.
+fn detail_lines(model: &Model, row: &Row) -> Vec<String> {
+    const INDENT: &str = "      ";
+    let width = model.columns.saturating_sub(INDENT.len()).max(1);
+    let path = row.path.display().to_string();
+    let rule = format!("rule: {}", row.rule);
+
+    let mut lines = Vec::new();
+    for text in [path.as_str(), rule.as_str(), row.detail.as_str()] {
+        let chars = text.chars().collect::<Vec<_>>();
+        for chunk in chars.chunks(width) {
+            let chunk = chunk.iter().collect::<String>();
+            lines.push(paint_line(
+                model.palette,
+                &[(INDENT, Ink::Text), (chunk.as_str(), Ink::Muted)],
+                model.columns,
+            ));
+        }
+    }
+    lines
+}
+
+/// `~/…` for a path under home, the whole path otherwise.
+fn shown_path(model: &Model, path: &Path) -> String {
+    let under_home = model
+        .home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok());
+    match under_home {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+fn tier_word(kind: RowKind) -> &'static str {
+    match kind {
+        RowKind::Safe => "SAFE",
+        RowKind::Caution => "CAUTION",
+        RowKind::Review => "REVIEW",
+    }
+}
+
+/// The keys that do something on this screen, and where the cursor is.
+fn footer_line(model: &Model) -> String {
+    let (keys, position) = match model.screen {
+        Screen::Volumes => {
+            let shown = model.shown_volumes().len();
+            let hidden = model.volumes.len() - shown;
+            let all = if model.all_volumes {
+                "a walkable only".to_owned()
+            } else {
+                format!("a all mounts ({hidden} hidden)")
+            };
+            (
+                format!("j/k move  u walk  {all}"),
+                position_text(model.volume_cursor, shown),
+            )
+        }
+        Screen::Reclaim => (
+            format!(
+                "space stage  d detail  f filter ({})  t apply",
+                model.filter.as_str()
+            ),
+            position_text(model.cursor, model.visible().len()),
+        ),
+        Screen::Usage => {
+            let order = match model.order {
+                Order::Size => "size",
+                Order::Name => "name",
+            };
+            (
+                format!("j/k move  enter open  backspace up  s sort ({order})"),
+                position_text(model.usage_cursor, model.child_count()),
+            )
+        }
+    };
+
+    // The position keeps its place. The key list is what gets cut, and `?`
+    // has all of it.
+    let room = model.columns.saturating_sub(position.chars().count() + 1);
+    let left = fit(&format!("{keys}  ? help  q quit"), room);
+    let used = left.chars().count() + position.chars().count();
+    let gap = " ".repeat(gap_width(model.columns, used));
+    paint_line(
+        model.palette,
+        &[
+            (left.as_str(), Ink::Muted),
+            (gap.as_str(), Ink::Text),
+            (position.as_str(), Ink::Muted),
+        ],
+        model.columns,
+    )
+}
+
+fn position_text(cursor: usize, len: usize) -> String {
+    if len == 0 {
+        String::new()
+    } else {
+        format!("{}/{len}", cursor.min(len - 1) + 1)
+    }
 }
 
 fn message_line(model: &Model) -> Option<String> {
-    if model.confirming {
-        let line = format!(
-            "confirm {}  {}",
-            format_bytes(model.staged_bytes()),
-            model.typed
-        );
-        return Some(paint_line(
-            model.palette,
-            &[(&line, Ink::Caution)],
-            model.columns,
-        ));
-    }
-    if model.message.is_empty() {
+    let (text, ink) = if model.mode == Mode::Confirm {
+        let total = format_bytes(model.staged_bytes());
+        let mut line = format!("confirm {total}  {}", model.typed);
+        if !model.message.is_empty() {
+            line.push_str("   ");
+            line.push_str(&model.message);
+        }
+        (line, Ink::Caution)
+    } else if model.applying() && model.message.is_empty() {
+        let text = "applying  q stops after the current entry";
+        (text.to_owned(), Ink::Caution)
+    } else if model.message.is_empty() {
         return None;
-    }
-    Some(paint_line(
-        model.palette,
-        &[(&model.message, Ink::Accent)],
-        model.columns,
-    ))
+    } else {
+        (model.message.clone(), Ink::Accent)
+    };
+    Some(paint_line(model.palette, &[(&text, ink)], model.columns))
 }
 
 fn viewport(lines: Vec<String>, focus: usize, budget: usize) -> Vec<String> {
@@ -1860,21 +2481,17 @@ fn file_label(path: &Path) -> String {
     )
 }
 
-fn short_tail(path: &Path, width: usize) -> String {
-    let text = path.display().to_string();
-    if text.chars().count() <= width || width == 0 {
-        return fit(&text, width);
+/// Keeps the end of `text`, which is the part of a path that tells rows apart.
+fn short_tail(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_owned();
+    }
+    if width <= 1 {
+        return String::new();
     }
 
-    let keep = width.saturating_sub(1);
-    let tail = text
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
+    let tail = text.chars().skip(count - (width - 1)).collect::<String>();
     format!("…{tail}")
 }
 
@@ -2088,6 +2705,11 @@ mod tests {
             Palette::Plain,
             UNIX_EPOCH,
         );
+        // Only the walkable mount is listed until `a` asks for all of them.
+        assert!(!render(&model).contains("/System"));
+        model.handle(Key::Char('a'));
+        assert!(render(&model).contains("/System"));
+        model.handle(Key::Char('g'));
         assert_eq!(model.handle(Key::Char('u')), Effect::None);
         model.handle(Key::Char('j'));
         assert_eq!(
@@ -2238,6 +2860,275 @@ mod tests {
         model.push_finding(finding(Tier::Safe, "/cache", 500, true));
         model.handle(Key::Char(' '));
         assert!(model.is_staged(Path::new("/proj/target")));
+    }
+
+    fn held(tier: Tier, path: &str, skip: Skip) -> Finding {
+        Finding {
+            skip: Some(skip),
+            ..finding(tier, path, 100, false)
+        }
+    }
+
+    #[test]
+    fn space_overrides_age_and_nothing_else() {
+        let mut model = Model::new(
+            Vec::new(),
+            vec![
+                held(Tier::Caution, "/a/target", Skip::Dirty),
+                held(Tier::Caution, "/b/target", Skip::Locked),
+                held(Tier::Caution, "/c/target", Skip::Partial),
+                held(Tier::Caution, "/d/target", Skip::Young),
+            ],
+            Vec::new(),
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.handle(Key::Char('2'));
+        for path in ["/a/target", "/b/target", "/c/target"] {
+            model.handle(Key::Char(' '));
+            assert!(!model.is_staged(Path::new(path)), "{path}");
+            assert!(render(&model).contains("held: "), "{}", render(&model));
+            model.handle(Key::Down);
+        }
+        model.handle(Key::Char(' '));
+        assert!(model.is_staged(Path::new("/d/target")));
+        let staged = model
+            .plan("host")
+            .entries
+            .iter()
+            .filter(|entry| entry.staged)
+            .count();
+        assert_eq!(staged, 1);
+    }
+
+    #[test]
+    fn a_burst_is_every_key_in_it() {
+        assert_eq!(
+            decode(b"1.5GiB\r"),
+            [
+                Key::Char('1'),
+                Key::Char('.'),
+                Key::Char('5'),
+                Key::Char('G'),
+                Key::Char('i'),
+                Key::Char('B'),
+                Key::Enter
+            ]
+        );
+        assert_eq!(
+            decode(b"\x1b[A\x1b[B\x1bOC\x1b[D\x1b[5~\x1b[6~\x1b[H\x1b[F\t"),
+            [
+                Key::Up,
+                Key::Down,
+                Key::Right,
+                Key::Left,
+                Key::PageUp,
+                Key::PageDown,
+                Key::Home,
+                Key::End,
+                Key::Tab
+            ]
+        );
+        // An unknown sequence is dropped whole. Its tail is not typed.
+        assert_eq!(decode(b"\x1b[1;5Aq"), [Key::Char('q')]);
+        assert_eq!(decode(b"\x1b["), []);
+    }
+
+    #[test]
+    fn pasted_total_confirms() {
+        let safe = finding(Tier::Safe, "/cache", 1536, true);
+        let mut model = Model::new(
+            Vec::new(),
+            vec![safe],
+            Vec::new(),
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.handle(Key::Char('2'));
+        model.handle(Key::Char('t'));
+        let effects = decode(b"1.5KiB\r")
+            .into_iter()
+            .map(|key| model.handle(key))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            effects.last(),
+            Some(&Effect::ConfirmApply {
+                typed: "1.5KiB".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_full_frame_fits_the_terminal_and_does_not_scroll_it() {
+        let findings = (0..40u64)
+            .map(|index| {
+                finding(
+                    Tier::Safe,
+                    &format!("/cache/{index:02}"),
+                    1_000 - index,
+                    true,
+                )
+            })
+            .collect();
+        let mut model = Model::new(Vec::new(), findings, Vec::new(), Palette::Plain, UNIX_EPOCH);
+        model.handle(Key::Char('2'));
+        for rows in [1, 3, 12, 24] {
+            model.set_rows(rows);
+            assert_eq!(render(&model).split('\n').count(), rows.min(24), "{rows}");
+
+            // A newline after the last row would scroll a full screen and
+            // push the title off the top.
+            let painted = frame_bytes(&model);
+            assert_eq!(painted.matches("\r\n").count(), rows - 1, "{rows}");
+            assert!(painted.ends_with("\u{1b}[K\u{1b}[J"));
+        }
+    }
+
+    #[test]
+    fn one_line_per_row_under_a_tier_heading() {
+        let findings = (0..12u64)
+            .map(|index| {
+                finding(
+                    Tier::Safe,
+                    &format!("/cache/{index:02}"),
+                    1_000 - index,
+                    true,
+                )
+            })
+            .collect();
+        let mut model = Model::new(Vec::new(), findings, Vec::new(), Palette::Plain, UNIX_EPOCH);
+        model.handle(Key::Char('2'));
+        model.set_rows(18);
+        let frame = render(&model);
+        let shown = frame.matches("/cache/").count();
+        assert!(shown >= 8, "{shown} rows in 18 lines:\n{frame}");
+        assert!(
+            frame.contains("SAFE    12 rows  11.6KiB  staged 11.6KiB"),
+            "{frame}"
+        );
+        assert!(frame.contains("1/12"), "{frame}");
+    }
+
+    #[test]
+    fn applied_rows_leave_and_skipped_rows_say_why() {
+        let mut model = Model::new(
+            Vec::new(),
+            vec![
+                finding(Tier::Safe, "/moved", 2048, true),
+                finding(Tier::Safe, "/busy", 1024, true),
+            ],
+            vec![review("/sessions")],
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.handle(Key::Char('2'));
+        model.begin_apply();
+        assert_eq!(model.handle(Key::Char('2')), Effect::None);
+        assert_eq!(model.handle(Key::Char('q')), Effect::Interrupt);
+
+        model.finish_apply(&ApplyReport {
+            moved: vec![crate::trash::Moved {
+                from: PathBuf::from("/moved"),
+                to: PathBuf::from("/trash/0-moved"),
+                id: "id".to_owned(),
+                logged: true,
+            }],
+            skipped: vec![crate::trash::Skipped {
+                path: PathBuf::from("/busy"),
+                reason: crate::trash::SkipMove::Locked,
+            }],
+        });
+        assert!(!model.applying());
+        assert_eq!(model.staged_bytes(), 0);
+        let frame = render(&model);
+        assert!(!frame.contains("/moved"), "{frame}");
+        assert!(frame.contains("skipped: path is locked"), "{frame}");
+        assert!(frame.contains("moved 1 (2.0KiB)  skipped 1"), "{frame}");
+        assert!(frame.contains("/sessions"), "{frame}");
+    }
+
+    #[test]
+    fn no_color_draws_plain_and_is_not_refused() {
+        assert_eq!(refuse(true, Some("xterm-256color")), None);
+        let palette = palette_from(Some("truecolor"), Some("xterm-256color"), true);
+        let frame = render(&volume_model(50, palette));
+        assert!(!frame.contains('\u{1b}'), "{frame}");
+        assert!(frame.contains('█'), "{frame}");
+    }
+
+    #[test]
+    fn title_follows_the_scan_and_a_walk() {
+        let mut model = volume_model(10, Palette::Plain);
+        model.set_scan_progress(4_000);
+        assert!(render(&model).contains("scanning  4000 dirs"));
+        model.finish_scan(&ScanSummary {
+            unreadable: 3,
+            roots_missing: 1,
+            ..ScanSummary::default()
+        });
+        let frame = render(&model);
+        assert!(frame.contains("scan done"), "{frame}");
+        assert!(frame.contains("3 unreadable, 1 roots missing"), "{frame}");
+
+        assert_eq!(
+            model.handle(Key::Char('u')),
+            Effect::WalkUsage {
+                mount: PathBuf::from("/Data")
+            }
+        );
+        model.begin_walk(PathBuf::from("/Data"));
+        model.set_walk_progress(12);
+        assert!(render(&model).contains("walking /Data  12 dirs"));
+        // The walk is elsewhere. Keys still answer, and a second walk waits.
+        assert_eq!(model.handle(Key::Char('u')), Effect::None);
+        assert!(render(&model).contains("still walking /Data"));
+    }
+
+    #[test]
+    fn a_leaf_is_not_entered() {
+        let mut model = Model::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.set_usage(UsageNode {
+            path: PathBuf::from("/vol"),
+            apparent_bytes: 4,
+            children: vec![UsageNode {
+                path: PathBuf::from("/vol/file"),
+                apparent_bytes: 4,
+                children: Vec::new(),
+            }],
+        });
+        model.handle(Key::Enter);
+        let frame = render(&model);
+        assert!(frame.contains("nothing listed below file"), "{frame}");
+        assert!(frame.contains("/vol"), "{frame}");
+    }
+
+    #[test]
+    fn paths_under_home_are_shortened_and_keep_their_tail() {
+        let long =
+            "/Users/ada/Documents/Github/some-organisation/some-repository/crates/inner/target";
+        let mut model = Model::new(
+            Vec::new(),
+            vec![finding(Tier::Caution, long, 10, false)],
+            Vec::new(),
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.set_home(Path::new("/Users/ada"));
+        model.handle(Key::Char('2'));
+        let frame = render(&model);
+        assert!(frame.contains("inner/target"), "{frame}");
+        assert!(!frame.contains("/Users/ada"), "{frame}");
+        // Detail wraps the whole path. Nothing is cut.
+        model.handle(Key::Char('d'));
+        let frame = render(&model);
+        let (first, second) = long.split_at(74);
+        assert!(frame.contains(first) && frame.contains(second), "{frame}");
     }
 
     fn volume_model(used: u64, palette: Palette) -> Model {
