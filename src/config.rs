@@ -95,8 +95,9 @@ pub enum RootStatus {
 
 /// Loads `~/.config/disk-health/{roots,exclude,ages}` under `home`.
 ///
-/// A missing file uses the builtin default. An empty `roots` file means the
-/// user cleared the project walk.
+/// A missing file uses the builtin default. For `roots` that is whichever of
+/// [`default_roots`] exist. An empty `roots` file means the user cleared the
+/// project walk.
 ///
 /// # Errors
 ///
@@ -127,7 +128,12 @@ pub fn load(home: &Path) -> Result<Loaded> {
     let dir = home.join(".config/disk-health");
 
     let roots = match read_lines(&dir.join("roots"))? {
-        None => default_roots(home),
+        // The defaults are guesses. One that is not there is not something
+        // the operator asked for, so it is not reported as missing.
+        None => default_roots(home)
+            .into_iter()
+            .filter(|root| fs::symlink_metadata(root).is_ok())
+            .collect(),
         Some(lines) => lines
             .iter()
             .map(|line| expand(home, line))
@@ -556,6 +562,19 @@ mod tests {
         let loaded = load(&home).unwrap();
         let canonical = fs::canonicalize(&kept).unwrap();
         assert!(path_is_denied(&canonical.join("target"), &loaded.deny));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_root_that_does_not_exist_is_dropped_and_a_configured_one_is_kept() {
+        let home = std::env::temp_dir().join(format!("disk-health-roots-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("Documents/Github")).unwrap();
+        assert_eq!(load(&home).unwrap().roots, [home.join("Documents/Github")]);
+
+        fs::create_dir_all(home.join(".config/disk-health")).unwrap();
+        fs::write(home.join(".config/disk-health/roots"), "~/nowhere\n").unwrap();
+        assert_eq!(load(&home).unwrap().roots, [home.join("nowhere")]);
         let _ = fs::remove_dir_all(&home);
     }
 

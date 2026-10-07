@@ -296,11 +296,13 @@ pub fn confine_to(mut volumes: Vec<Volume>, home_dev: u64) -> Vec<Volume> {
 }
 
 fn classify(mount: &str, fstype: &str, flags: u32) -> (bool, Option<&'static str>) {
-    if let Some(note) = refused_mount(mount) {
-        return (false, Some(note));
-    }
+    // Before the mount point is looked at: the automounter's `home` sits
+    // under `/System/Volumes/Data` and is not a system volume.
     if fstype == "devfs" || fstype == "autofs" {
         return (false, Some("filesystem is not walked"));
+    }
+    if let Some(note) = refused_mount(mount) {
+        return (false, Some(note));
     }
     if flags & MNT_LOCAL == 0 {
         return (false, Some("remote filesystem"));
@@ -497,6 +499,9 @@ mod tests {
         assert!(!root.walkable);
         let devfs = describe(&parse_statfs(&record("devfs", "/dev", MNT_LOCAL)).unwrap());
         assert!(!devfs.walkable);
+        let auto =
+            describe(&parse_statfs(&record("autofs", "/System/Volumes/Data/home", 0)).unwrap());
+        assert_eq!(auto.note, Some("filesystem is not walked"));
         let hidden = describe(
             &parse_statfs(&record(
                 "apfs",
