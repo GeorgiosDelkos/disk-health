@@ -221,6 +221,9 @@ pub struct Model {
     all_volumes: bool,
 
     rows: Vec<Row>,
+    /// Rules whose findings are loose files. Their rows are shown as one
+    /// line per directory.
+    grouped_rules: Vec<String>,
     cursor: usize,
     filter: Filter,
     detail: bool,
@@ -287,6 +290,7 @@ impl Model {
             volume_cursor: 0,
             all_volumes: false,
             rows,
+            grouped_rules: Vec::new(),
             cursor: 0,
             filter: Filter::All,
             detail: false,
@@ -550,6 +554,16 @@ impl Model {
         self.bump();
     }
 
+    /// Names the rules whose findings are single files in one directory.
+    ///
+    /// A log directory can hold dozens of them, a few KiB each. They are
+    /// drawn as one line. Each file keeps its own row underneath, so the
+    /// plan still names every file and its own staged bit.
+    fn set_grouped_rules(&mut self, rules: Vec<String>) {
+        self.grouped_rules = rules;
+        self.bump();
+    }
+
     /// Sets the directory shown as `~` in paths.
     fn set_home(&mut self, home: &Path) {
         self.home = Some(home.to_path_buf());
@@ -810,30 +824,66 @@ impl Model {
         node_at(self.usage.as_ref(), &self.usage_path).map_or(0, |node| node.children.len())
     }
 
-    /// Row indexes in screen order: by tier, then largest first.
-    fn visible(&self) -> Vec<usize> {
-        let mut indexes = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| self.filter.matches(row.kind))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+    /// Lines of the reclaim list in screen order: by tier, then largest
+    /// first. A line is one row, or every loose-file row of one rule in
+    /// one directory.
+    fn visible(&self) -> Vec<Vec<usize>> {
+        let mut lines: Vec<Vec<usize>> = Vec::new();
+        let mut grouped: Vec<(&str, &Path, usize)> = Vec::new();
+        for (index, row) in self.rows.iter().enumerate() {
+            if !self.filter.matches(row.kind) {
+                continue;
+            }
+            let Some(directory) = self.group_directory(row) else {
+                lines.push(vec![index]);
+                continue;
+            };
+            let known = grouped
+                .iter()
+                .find(|(rule, path, _)| *rule == row.rule && *path == directory);
+            if let Some((_, _, line)) = known {
+                lines[*line].push(index);
+            } else {
+                grouped.push((row.rule.as_str(), directory, lines.len()));
+                lines.push(vec![index]);
+            }
+        }
 
-        indexes.sort_by(|&left, &right| {
-            let (left, right) = (&self.rows[left], &self.rows[right]);
-            left.kind
-                .cmp(&right.kind)
-                .then(right.bytes.cmp(&left.bytes))
-                .then(left.path.cmp(&right.path))
-                .then(left.rule.cmp(&right.rule))
+        lines.sort_by(|left, right| {
+            let (first_left, first_right) = (&self.rows[left[0]], &self.rows[right[0]]);
+            first_left
+                .kind
+                .cmp(&first_right.kind)
+                .then(self.line_bytes(right).cmp(&self.line_bytes(left)))
+                .then(self.line_path(left).cmp(self.line_path(right)))
+                .then(first_left.rule.cmp(&first_right.rule))
         });
-        indexes
+        lines
+    }
+
+    /// The directory a loose-file row is grouped under, if its rule groups.
+    fn group_directory<'a>(&self, row: &'a Row) -> Option<&'a Path> {
+        if row.kind != RowKind::Safe || !self.grouped_rules.contains(&row.rule) {
+            return None;
+        }
+        row.path.parent()
+    }
+
+    fn line_bytes(&self, line: &[usize]) -> u64 {
+        line.iter()
+            .fold(0, |sum, index| sum.saturating_add(self.rows[*index].bytes))
+    }
+
+    /// What a line is called: the row's path, or the directory of a group.
+    fn line_path(&self, line: &[usize]) -> &Path {
+        let first = &self.rows[line[0]];
+        self.group_directory(first).unwrap_or(&first.path)
     }
 
     fn anchor(&self) -> Option<PathBuf> {
-        let index = *self.visible().get(self.cursor)?;
-        Some(self.rows[index].path.clone())
+        let visible = self.visible();
+        let line = visible.get(self.cursor)?;
+        Some(self.line_path(line).to_path_buf())
     }
 
     fn restore_anchor(&mut self, path: Option<PathBuf>) {
@@ -842,18 +892,16 @@ impl Model {
             return;
         };
         let visible = self.visible();
-        if let Some(pos) = visible
-            .iter()
-            .position(|index| self.rows[*index].path == path)
-        {
+        if let Some(pos) = visible.iter().position(|line| self.line_path(line) == path) {
             self.cursor = pos;
         } else {
             self.clamp_reclaim();
         }
     }
 
+    /// The row space acts on. A group is safe rows, which space leaves alone.
     fn selected_row(&self) -> Option<usize> {
-        self.visible().get(self.cursor).copied()
+        self.visible().get(self.cursor).map(|line| line[0])
     }
 
     fn clamp_reclaim(&mut self) {
@@ -1201,6 +1249,14 @@ fn drive(session: &Session<'_>) -> crate::Result<Option<String>> {
     let palette = palette_from(session.colorterm, session.term, session.no_color);
     let mut model = Model::new(volumes, Vec::new(), Vec::new(), palette, SystemTime::now());
     model.set_home(session.home);
+    model.set_grouped_rules(
+        loaded
+            .safe_rules
+            .iter()
+            .filter(|rule| matches!(rule.anchor, crate::rules::SafeAnchor::Files(_)))
+            .map(|rule| rule.id.to_owned())
+            .collect(),
+    );
     if let Ok((rows, cols)) = crate::tty::window_size(0) {
         model.set_columns(usize::from(cols));
         model.set_rows(usize::from(rows));
@@ -1538,15 +1594,23 @@ fn scan_note(summary: &ScanSummary) -> Option<String> {
         parts.push(format!("{} unreadable", summary.unreadable));
     }
     if summary.roots_missing > 0 {
-        parts.push(format!("{} roots missing", summary.roots_missing));
+        parts.push(format!("{} missing", roots(summary.roots_missing)));
     }
     if summary.roots_denied > 0 {
-        parts.push(format!("{} roots denied", summary.roots_denied));
+        parts.push(format!("{} refused", roots(summary.roots_denied)));
     }
     if parts.is_empty() {
         None
     } else {
         Some(format!("scan done: {}", parts.join(", ")))
+    }
+}
+
+fn roots(count: usize) -> String {
+    if count == 1 {
+        "1 root".to_owned()
+    } else {
+        format!("{count} roots")
     }
 }
 
@@ -1603,9 +1667,12 @@ fn row_from_finding(finding: Finding, now: SystemTime) -> Row {
         Tier::Safe => RowKind::Safe,
         Tier::Caution => RowKind::Caution,
     };
+    // The newest file inside, which is what the age gate looks at. A
+    // directory's own mtime can be a month old while its tree is hot.
     let age = finding
-        .mtime
-        .and_then(|mtime| now.duration_since(mtime).ok());
+        .newest
+        .or(finding.mtime)
+        .and_then(|newest| now.duration_since(newest).ok());
     Row {
         kind,
         rule: finding.rule.to_owned(),
@@ -1757,7 +1824,7 @@ fn sort_children(node: &mut UsageNode, order: Order) {
     }
 }
 
-/// Foreground for words, background for meter cells.
+/// The color of a word or of a bar's cells.
 ///
 /// Plain ignores the ink and keeps the glyph, so a test can still see
 /// which share is which.
@@ -1787,7 +1854,6 @@ const SLICE_RGB: [(u8, u8, u8); 8] = [
 ];
 const SLICE_256: [u8; 8] = [43, 75, 141, 215, 204, 149, 110, 209];
 const SLICE_16: [u8; 8] = [36, 34, 35, 33, 31, 32, 37, 36];
-const SLICE_BG16: [u8; 8] = [46, 44, 45, 43, 41, 42, 47, 46];
 const PLAIN_GLYPHS: [char; 5] = ['█', '▓', '▒', '░', '·'];
 
 fn rule_line(model: &Model) -> String {
@@ -2123,47 +2189,44 @@ fn reclaim_body(model: &Model) -> (Vec<String>, usize) {
         return (vec![text.to_owned()], 0);
     }
 
-    let total = visible.iter().fold(0u64, |sum, index| {
-        sum.saturating_add(model.rows[*index].bytes)
-    });
     let mut lines = Vec::new();
     let mut focus = 0;
     let mut group = None;
-    for (position, index) in visible.iter().enumerate() {
-        let row = &model.rows[*index];
-        if group != Some(row.kind) {
+    let mut largest = 0;
+    for (position, line) in visible.iter().enumerate() {
+        let kind = model.rows[line[0]].kind;
+        if group != Some(kind) {
             if group.is_some() {
                 lines.push(String::new());
             }
-            lines.push(group_heading(model, row.kind, &visible));
-            group = Some(row.kind);
+            lines.push(group_heading(model, kind, &visible));
+            group = Some(kind);
+            // Lines are largest first within a tier, so this one is the scale.
+            largest = model.line_bytes(line);
         }
 
         let selected = position == model.cursor;
         if selected {
             focus = lines.len();
         }
-        lines.push(reclaim_line(model, row, selected, total));
+        lines.push(reclaim_line(model, line, selected, largest));
         if selected && model.detail {
-            lines.extend(detail_lines(model, row));
+            lines.extend(detail_lines(model, line));
         }
     }
     (lines, focus)
 }
 
-/// One line per tier: how many rows, how much, and how much of it is staged.
-fn group_heading(model: &Model, kind: RowKind, visible: &[usize]) -> String {
-    let rows = visible
-        .iter()
-        .map(|index| &model.rows[*index])
-        .filter(|row| row.kind == kind);
+/// One line per tier: how many lines, how much, and how much of it is staged.
+fn group_heading(model: &Model, kind: RowKind, visible: &[Vec<usize>]) -> String {
     let (mut count, mut bytes, mut staged) = (0usize, 0u64, 0u64);
-    for row in rows {
-        count += 1;
-        bytes = bytes.saturating_add(row.bytes);
-        if row.staged {
-            staged = staged.saturating_add(row.bytes);
+    for line in visible {
+        if model.rows[line[0]].kind != kind {
+            continue;
         }
+        count += 1;
+        bytes = bytes.saturating_add(model.line_bytes(line));
+        staged = staged.saturating_add(staged_bytes_of(model, line));
     }
 
     let word = format!("  {:<8}", tier_word(kind));
@@ -2183,6 +2246,13 @@ fn group_heading(model: &Model, kind: RowKind, visible: &[usize]) -> String {
     )
 }
 
+fn staged_bytes_of(model: &Model, line: &[usize]) -> u64 {
+    line.iter()
+        .map(|index| &model.rows[*index])
+        .filter(|row| row.staged)
+        .fold(0, |sum, row| sum.saturating_add(row.bytes))
+}
+
 /// Cells in a reclaim row's bar.
 const ROW_BAR: usize = 10;
 /// Narrower than this, a row drops its bar and keeps the path.
@@ -2190,65 +2260,131 @@ const ROW_BAR_MIN_COLUMNS: usize = 72;
 /// Narrower than this, a row drops the rule id, which `d` still shows.
 const ROW_RULE_MIN_COLUMNS: usize = 100;
 
-fn reclaim_line(model: &Model, row: &Row, selected: bool, total: u64) -> String {
+/// One line of the list. `largest` is the biggest line in the same tier:
+/// the bar compares a row with its neighbours, and against the total of
+/// every tier each of them would be a single cell.
+fn reclaim_line(model: &Model, line: &[usize], selected: bool, largest: u64) -> String {
+    let first = &model.rows[line[0]];
+    let bytes = model.line_bytes(line);
     let marker = if selected { "▸ " } else { "  " };
     let marker_ink = if selected { Ink::Accent } else { Ink::Muted };
-    let size = format!("{:>9} ", format_bytes(row.bytes));
-    let size_ink = if selected { Ink::Title } else { Ink::Text };
-    let mut line = paint_line(
+    let size = format!("{:>9} ", format_bytes(bytes));
+    let lit = if selected { Ink::Title } else { Ink::Text };
+    let mut out = paint_line(
         model.palette,
-        &[(marker, marker_ink), (size.as_str(), size_ink)],
+        &[(marker, marker_ink), (size.as_str(), lit)],
         model.columns,
     );
     let mut used = cells(marker) + cells(&size);
 
     if model.columns >= ROW_BAR_MIN_COLUMNS {
-        let filled = magnitude(row.bytes, total, ROW_BAR);
-        line.push_str(&meter(
+        let filled = magnitude(bytes, largest, ROW_BAR);
+        out.push_str(&meter(
             model.palette,
             filled,
             ROW_BAR,
-            tier_ink(row.kind),
-            tier_glyph(row.kind),
+            tier_ink(first.kind),
+            tier_glyph(first.kind),
         ));
         used += ROW_BAR;
     }
 
-    let state = format!(" {:<18}", state_text(row));
-    let state_ink = if row.staged {
-        tier_ink(row.kind)
-    } else {
-        Ink::Muted
-    };
+    let (state, state_ink) = line_state(model, line);
+    let state = format!(" {state:<18}");
+    let age = line.iter().filter_map(|index| model.rows[*index].age).min();
     let facts = if model.columns >= ROW_RULE_MIN_COLUMNS {
-        format!("{:>5}  {:<16} ", age_text(row.age), row.rule)
+        format!("{:>5}  {:<16} ", age_text(age), first.rule)
     } else {
-        format!("{:>5}  ", age_text(row.age))
+        format!("{:>5}  ", age_text(age))
     };
     let left = model.columns.saturating_sub(used);
-    let taken = cells(&state) + cells(&facts);
-    let path = short_tail(&shown_path(model, &row.path), left.saturating_sub(taken));
-    line.push_str(&paint_line(
+    let room = left.saturating_sub(cells(&state) + cells(&facts));
+    let path = line_label(model, line, room);
+    let path_ink = if selected { Ink::Title } else { Ink::Muted };
+    out.push_str(&paint_line(
         model.palette,
         &[
             (state.as_str(), state_ink),
             (facts.as_str(), Ink::Text),
-            (path.as_str(), Ink::Muted),
+            (path.as_str(), path_ink),
         ],
         left,
     ));
-    line
+    out
 }
 
-/// The full path and the rule's reasons, wrapped so neither is cut.
-fn detail_lines(model: &Model, row: &Row) -> Vec<String> {
+/// The state column and its color: green moves, yellow waits, red failed.
+fn line_state(model: &Model, line: &[usize]) -> (String, Ink) {
+    if let [index] = line {
+        let row = &model.rows[*index];
+        let ink = match (row.kind, row.staged, &row.skipped) {
+            (RowKind::Review, ..) => Ink::Review,
+            (_, true, _) => Ink::Safe,
+            (_, false, Some(_)) => Ink::Danger,
+            (_, false, None) => Ink::Caution,
+        };
+        return (state_text(row), ink);
+    }
+
+    let staged = line
+        .iter()
+        .filter(|index| model.rows[**index].staged)
+        .count();
+    if staged == line.len() {
+        ("staged".to_owned(), Ink::Safe)
+    } else if staged == 0 {
+        ("held".to_owned(), Ink::Caution)
+    } else {
+        (format!("staged {staged}/{}", line.len()), Ink::Safe)
+    }
+}
+
+/// The path of a row, or the directory of a group and how many files it holds.
+fn line_label(model: &Model, line: &[usize], room: usize) -> String {
+    let path = shown_path(model, model.line_path(line));
+    if line.len() == 1 && model.group_directory(&model.rows[line[0]]).is_none() {
+        return short_tail(&path, room);
+    }
+
+    let noun = if line.len() == 1 { "file" } else { "files" };
+    let count = format!("  {} {noun}", line.len());
+    let mut label = short_tail(&path, room.saturating_sub(cells(&count)));
+    label.push_str(&count);
+    label
+}
+
+/// Files a group's detail lists before it says how many more there are.
+const DETAIL_FILES: usize = 8;
+
+/// The full path and the rule's reasons, wrapped so neither is cut. For a
+/// group, the directory and then each file with its own state.
+fn detail_lines(model: &Model, line: &[usize]) -> Vec<String> {
     const INDENT: &str = "      ";
     let width = model.columns.saturating_sub(INDENT.len()).max(1);
-    let path = row.path.display().to_string();
-    let rule = format!("rule: {}", row.rule);
+    let first = &model.rows[line[0]];
+    let mut texts = vec![
+        model.line_path(line).display().to_string(),
+        format!("rule: {}", first.rule),
+    ];
+    if model.group_directory(first).is_none() {
+        texts.push(first.detail.clone());
+    } else {
+        for index in line.iter().take(DETAIL_FILES) {
+            let row = &model.rows[*index];
+            texts.push(format!(
+                "{:>9}  {:<14} {}",
+                format_bytes(row.bytes),
+                state_text(row),
+                file_label(&row.path)
+            ));
+        }
+        if line.len() > DETAIL_FILES {
+            texts.push(format!("and {} more", line.len() - DETAIL_FILES));
+        }
+    }
 
     let mut lines = Vec::new();
-    for text in [path.as_str(), rule.as_str(), row.detail.as_str()] {
+    for text in &texts {
         for piece in wrapped(&printable(text), width) {
             lines.push(paint_line(
                 model.palette,
@@ -2544,21 +2680,20 @@ fn paint_fg(palette: Palette, ink: Ink, text: &str) -> String {
     wrap(fg_code(palette, ink), text)
 }
 
+/// Draws `count` cells of a bar.
+///
+/// The cells are block characters in the ink's color, not spaces on a
+/// colored background. A dark track painted as background disappears on a
+/// dark theme, and a bar that is one bright cell on an invisible track
+/// reads as no bar at all. A glyph is there whatever the theme does.
 fn paint_cells(palette: Palette, ink: Ink, glyph: char, count: usize) -> String {
-    if count == 0 {
-        return String::new();
-    }
-    let shown = if palette == Palette::Plain {
-        glyph
-    } else {
-        ' '
+    let shown = match (palette, ink) {
+        (Palette::Plain, _) | (_, Ink::Track) => glyph,
+        // With color, the color tells the tiers apart and the bar is solid.
+        _ => '█',
     };
     let text: String = std::iter::repeat_n(shown, count).collect();
-    if palette == Palette::Plain {
-        text
-    } else {
-        wrap(bg_code(palette, ink), &text)
-    }
+    paint_fg(palette, ink, &text)
 }
 
 fn wrap(code: Option<String>, text: &str) -> String {
@@ -2583,25 +2718,13 @@ fn fg_code(palette: Palette, ink: Ink) -> Option<String> {
     }
 }
 
-fn bg_code(palette: Palette, ink: Ink) -> Option<String> {
-    match palette {
-        Palette::Plain => None,
-        Palette::Ansi16 => Some(ansi16_bg(ink).to_string()),
-        Palette::Ansi256 => Some(format!("48;5;{}", ansi256_bg(ink))),
-        Palette::True => {
-            let (red, green, blue) = rgb(ink);
-            Some(format!("48;2;{red};{green};{blue}"))
-        }
-    }
-}
-
 fn rgb(ink: Ink) -> (u8, u8, u8) {
     match ink {
         Ink::Safe => (72, 201, 146),
         Ink::Caution => (240, 180, 70),
         Ink::Review => (138, 156, 240),
         Ink::Danger => (235, 98, 104),
-        Ink::Track => (54, 58, 69),
+        Ink::Track => (98, 104, 124),
         Ink::Title => (236, 238, 242),
         Ink::Muted => (140, 148, 162),
         Ink::Accent => (120, 210, 190),
@@ -2625,14 +2748,6 @@ fn ansi256(ink: Ink) -> u8 {
     }
 }
 
-fn ansi256_bg(ink: Ink) -> u8 {
-    match ink {
-        Ink::Track | Ink::Muted => 236,
-        Ink::Slice(index) => SLICE_256[usize::from(index) % SLICE_256.len()],
-        other => ansi256(other),
-    }
-}
-
 fn ansi16_fg(ink: Ink) -> Option<u8> {
     let code = match ink {
         Ink::Text => return None,
@@ -2646,18 +2761,6 @@ fn ansi16_fg(ink: Ink) -> Option<u8> {
         Ink::Slice(index) => SLICE_16[usize::from(index) % SLICE_16.len()],
     };
     Some(code)
-}
-
-fn ansi16_bg(ink: Ink) -> u8 {
-    match ink {
-        Ink::Safe => 42,
-        Ink::Caution => 43,
-        Ink::Review => 45,
-        Ink::Danger => 41,
-        Ink::Track | Ink::Muted => 100,
-        Ink::Title | Ink::Text | Ink::Accent => 47,
-        Ink::Slice(index) => SLICE_BG16[usize::from(index) % SLICE_BG16.len()],
-    }
 }
 
 fn tier_ink(kind: RowKind) -> Ink {
@@ -3006,9 +3109,25 @@ mod tests {
     fn truecolor_volume_bar_uses_heat() {
         let cool = render(&volume_model(10, Palette::True));
         let hot = render(&volume_model(90, Palette::True));
-        assert!(cool.contains("\u{1b}[48;2;72;201;146m"), "{cool}");
-        assert!(hot.contains("\u{1b}[48;2;235;98;104m"), "{hot}");
-        assert!(!cool.contains('█'));
+        // Blocks in the foreground color. A background would vanish on a
+        // theme whose own background is close to the track.
+        assert!(cool.contains("\u{1b}[38;2;72;201;146m██"), "{cool}");
+        assert!(hot.contains("\u{1b}[38;2;235;98;104m██"), "{hot}");
+        assert!(!cool.contains("\u{1b}[48;"), "{cool}");
+        assert!(cool.contains('░'), "{cool}");
+
+        // With color every fill is the solid block. The shaded glyphs are
+        // how the tiers are told apart without it.
+        let mut model = Model::new(
+            Vec::new(),
+            vec![finding(Tier::Caution, "/proj/target", 20, false)],
+            Vec::new(),
+            Palette::True,
+            UNIX_EPOCH,
+        );
+        model.handle(Key::Char('2'));
+        let frame = render(&model);
+        assert!(frame.contains('█') && !frame.contains('▓'), "{frame}");
     }
 
     #[test]
@@ -3553,7 +3672,7 @@ mod tests {
         });
         let frame = render(&model);
         assert!(frame.contains("scan done"), "{frame}");
-        assert!(frame.contains("3 unreadable, 1 roots missing"), "{frame}");
+        assert!(frame.contains("3 unreadable, 1 root missing"), "{frame}");
 
         assert_eq!(
             model.handle(Key::Char('u')),
@@ -3614,6 +3733,89 @@ mod tests {
         let frame = render(&model);
         let (first, second) = long.split_at(74);
         assert!(frame.contains(first) && frame.contains(second), "{frame}");
+    }
+
+    #[test]
+    fn loose_files_of_one_rule_are_one_line_and_stay_separate_plan_entries() {
+        let mut findings = (0..12u64)
+            .map(|index| Finding {
+                rule: "logs",
+                ..finding(
+                    Tier::Safe,
+                    &format!("/h/.tool/logs/{index:02}.log"),
+                    100,
+                    index < 9,
+                )
+            })
+            .collect::<Vec<_>>();
+        findings.push(finding(Tier::Safe, "/h/.cargo/registry", 5_000, true));
+        let mut model = Model::new(Vec::new(), findings, Vec::new(), Palette::Plain, UNIX_EPOCH);
+        model.set_grouped_rules(vec!["logs".to_owned()]);
+        model.set_home(Path::new("/h"));
+        model.handle(Key::Char('2'));
+
+        let frame = render(&model);
+        assert!(frame.contains("SAFE    2 rows"), "{frame}");
+        assert!(frame.contains("staged 9/12"), "{frame}");
+        assert!(frame.contains("~/.tool/logs  12 files"), "{frame}");
+        assert!(!frame.contains("00.log"), "{frame}");
+        assert!(frame.contains("1/2"), "{frame}");
+
+        // Detail lists the files, and stops before it fills the screen.
+        model.handle(Key::Down);
+        model.handle(Key::Char('d'));
+        let frame = render(&model);
+        assert!(
+            frame.contains("00.log") && frame.contains("and 4 more"),
+            "{frame}"
+        );
+
+        // Space leaves a group alone, and the plan still names every file.
+        model.handle(Key::Char(' '));
+        let plan = model.plan("host");
+        assert_eq!(plan.entries.len(), 13);
+        assert_eq!(plan.entries.iter().filter(|entry| entry.staged).count(), 10);
+    }
+
+    #[test]
+    fn a_row_bar_compares_rows_within_their_tier() {
+        let mut model = Model::new(
+            Vec::new(),
+            vec![
+                finding(Tier::Caution, "/huge/target", 100_000, false),
+                finding(Tier::Safe, "/a", 1_000, true),
+                finding(Tier::Safe, "/b", 500, true),
+            ],
+            Vec::new(),
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.handle(Key::Char('2'));
+        let frame = render(&model);
+        let bar = |path: &str| {
+            let line = frame.lines().find(|line| line.ends_with(path)).unwrap();
+            count_char(line, '█')
+        };
+        // Against the total of every tier both would be a single cell.
+        assert_eq!(bar("/a"), 10, "{frame}");
+        assert_eq!(bar("/b"), 5, "{frame}");
+    }
+
+    #[test]
+    fn age_is_the_newest_file_not_the_directory() {
+        let now = UNIX_EPOCH + Duration::from_hours(100 * 24);
+        let hot = Finding {
+            mtime: Some(UNIX_EPOCH),
+            newest: Some(now - Duration::from_hours(3)),
+            skip: Some(Skip::Hot),
+            ..finding(Tier::Safe, "/cache", 10, false)
+        };
+        let mut model = Model::new(Vec::new(), vec![hot], Vec::new(), Palette::Plain, now);
+        model.handle(Key::Char('2'));
+        let frame = render(&model);
+        assert!(frame.contains("held: hot"), "{frame}");
+        assert!(frame.contains("   3h  "), "{frame}");
+        assert!(!frame.contains("100d"), "{frame}");
     }
 
     fn volume_model(used: u64, palette: Palette) -> Model {
