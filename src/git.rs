@@ -46,11 +46,8 @@ pub struct SystemGit;
 
 impl GitProbe for SystemGit {
     fn status(&self, project: &Path) -> GitTree {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(project)
+        let output = read_only_git(project)
             .args(["status", "--porcelain"])
-            .env("GIT_TERMINAL_PROMPT", "0")
             .output();
         let Ok(output) = output else {
             return GitTree::Unknown;
@@ -71,6 +68,23 @@ impl GitProbe for SystemGit {
             GitTree::Unknown
         }
     }
+}
+
+/// Options that go before the subcommand on every `git` this crate runs.
+///
+/// `git status` refreshes the index when it can take the lock, and runs the
+/// program named by `core.fsmonitor` in the repository's own config. A scan
+/// writes nothing and runs nothing a repository chose.
+pub const READ_ONLY_OPTIONS: &[&str] = &["--no-optional-locks", "-c", "core.fsmonitor=false"];
+
+fn read_only_git(directory: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(READ_ONLY_OPTIONS)
+        .arg("-C")
+        .arg(directory)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
 }
 
 /// Fixed answers for tests, keyed by the project directory.
@@ -176,12 +190,7 @@ struct GitText {
 }
 
 fn git_text(path: &Path, args: &[&str]) -> GitText {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output();
+    let output = read_only_git(path).args(args).output();
     let Ok(output) = output else {
         return GitText {
             ok: false,
@@ -216,6 +225,46 @@ fn line_of(text: &GitText) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_leaves_the_index_alone_and_ignores_a_repository_fsmonitor() {
+        let repo = std::env::temp_dir().join(format!("disk-health-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let ran = repo.join("fsmonitor-ran");
+        let hook = repo.join("hook.sh");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git").arg("-C").arg(&repo).args(args).status();
+            assert!(status.is_ok_and(|status| status.success()), "git {args:?}");
+        };
+        git(&["init", "--quiet"]);
+        git(&[
+            "config",
+            "core.fsmonitor",
+            &format!("sh {}", hook.display()),
+        ]);
+        std::fs::write(repo.join("file"), b"x").unwrap();
+        git(&["add", "file"]);
+        let index = std::fs::metadata(repo.join(".git/index"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // `git add` above ran the program. That proves the config is live.
+        assert!(ran.exists(), "the fixture's fsmonitor program never ran");
+        std::fs::remove_file(&ran).unwrap();
+
+        assert_eq!(SystemGit.status(&repo), GitTree::Dirty);
+
+        assert!(!ran.exists(), "the repository's fsmonitor program ran");
+        let after = std::fs::metadata(repo.join(".git/index"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(index, after, "git status rewrote the index");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 
     #[test]
     fn worktree_git_is_three_fixed_commands() {
