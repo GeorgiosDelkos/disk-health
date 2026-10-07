@@ -31,6 +31,18 @@ pub enum Error {
         /// What to fix.
         message: String,
     },
+    /// A plan file is missing, truncated, or does not match its own id.
+    Plan {
+        /// What to fix.
+        message: String,
+    },
+    /// `--confirm` did not echo the plan id, or the typed total was wrong.
+    ///
+    /// Nothing is renamed when this is returned.
+    PlanMismatch {
+        /// The id or total that was required.
+        message: String,
+    },
 }
 
 /// Crate result.
@@ -87,7 +99,10 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage { message } | Self::Config { message } => f.write_str(message),
+            Self::Usage { message }
+            | Self::Config { message }
+            | Self::Plan { message }
+            | Self::PlanMismatch { message } => f.write_str(message),
             Self::Io {
                 operation, path, ..
             } => write!(f, "cannot {operation} {}", path.display()),
@@ -99,7 +114,10 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Usage { .. } | Self::Config { .. } => None,
+            Self::Usage { .. }
+            | Self::Config { .. }
+            | Self::Plan { .. }
+            | Self::PlanMismatch { .. } => None,
         }
     }
 }

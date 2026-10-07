@@ -1,6 +1,13 @@
-//! `disk-health` binary. The scan is read-only.
+//! `disk-health` binary.
+//!
+//! Scan is read-only. `apply` is the command that renames, and only after
+//! the plan id matches.
 
 fn main() {
+    if !disk_health::platform_supported() {
+        refuse_platform();
+        std::process::exit(1);
+    }
     let code = match disk_health::cli::main_from(std::env::args_os()) {
         Ok(code) => code,
         Err(err) => {
@@ -9,6 +16,14 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[allow(
+    clippy::print_stderr,
+    reason = "a non-macOS binary has no other channel"
+)]
+fn refuse_platform() {
+    eprintln!("disk-health: disk-health runs on macOS");
 }
 
 #[allow(clippy::print_stderr, reason = "operational errors go to stderr")]

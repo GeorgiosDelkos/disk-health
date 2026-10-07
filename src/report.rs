@@ -4,7 +4,6 @@
 //! are strings so a later plan file can round-trip them. Byte totals are
 //! numbers because a disk this tool will see fits in that range.
 
-use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,6 +58,7 @@ fn one_decimal(bytes: u64, unit: u64, suffix: &str) -> String {
 ///     dirs_visited: 0,
 ///     roots_missing: Vec::new(),
 ///     roots_denied: Vec::new(),
+///     review: Vec::new(),
 /// };
 /// write_text(&report);
 /// ```
@@ -115,6 +115,54 @@ pub fn write_text(report: &Report) {
     print_paths("roots denied", &report.roots_denied);
     println!("unreadable entries: {}", report.unreadable);
     println!("project directories visited: {}", report.dirs_visited);
+    write_review(&report.review);
+}
+
+#[allow(
+    clippy::print_stdout,
+    reason = "this is the scan command's text report"
+)]
+fn write_review(items: &[crate::review::Item]) {
+    if items.is_empty() {
+        return;
+    }
+    println!();
+    println!("review (not deleted):");
+    for item in items {
+        println!(
+            "{}  {}  {}",
+            item.class.as_str(),
+            format_bytes(item.apparent_bytes),
+            item.path.display()
+        );
+        write_review_detail(item);
+    }
+}
+
+#[allow(
+    clippy::print_stdout,
+    reason = "this is the scan command's text report"
+)]
+fn write_review_detail(item: &crate::review::Item) {
+    if let Some(branch) = &item.branch {
+        let dirty = match item.dirty {
+            Some(true) => "dirty",
+            Some(false) => "clean",
+            None => "git unknown",
+        };
+        println!("      {dirty}  branch {branch}");
+    }
+    if let Some(advice) = &item.advice {
+        println!("      advice: {advice}");
+    }
+    if item.active {
+        println!("      active toolchain");
+    }
+    if item.caution_child_bytes > 0 {
+        let bytes = format_bytes(item.caution_child_bytes);
+        println!("      caution children: {bytes}");
+    }
+    println!("      {}", item.note);
 }
 
 #[allow(
@@ -145,6 +193,7 @@ fn print_paths(label: &str, paths: &[std::path::PathBuf]) {
 ///     dirs_visited: 0,
 ///     roots_missing: Vec::new(),
 ///     roots_denied: Vec::new(),
+///     review: Vec::new(),
 /// };
 /// assert!(to_json(&report).contains("\"kind\": \"scan\""));
 /// ```
@@ -176,7 +225,12 @@ pub fn to_json(report: &Report) -> String {
         }
         push_finding(&mut out, finding);
     }
-    out.push_str("\n  ]\n}\n");
+    out.push_str("\n  ],\n  \"review\": [\n");
+    crate::review::append_json(&mut out, &report.review);
+    if !report.review.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("  ]\n}\n");
     out
 }
 
@@ -284,20 +338,8 @@ fn pad(out: &mut String, indent: usize) {
 }
 
 fn push_escaped(out: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => {
-                let code = u32::from(ch);
-                write!(out, "\\u{code:04x}").expect("formatting into a String is infallible");
-            }
-            ch => out.push(ch),
-        }
-    }
+    // One escape path. A second encoder would let a quote through one of them.
+    crate::json::escape_into(out, value);
 }
 
 fn display_path(path: &Path) -> String {

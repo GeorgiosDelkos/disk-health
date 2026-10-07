@@ -123,6 +123,10 @@ pub struct SafeRule {
     pub regenerate: Option<&'static str>,
     /// Why this path is safe to remove.
     pub rationale: &'static str,
+    /// Lock files the owning tool holds while it uses the path, relative to home.
+    ///
+    /// The candidate is not staged while another process holds one of them.
+    pub locks: &'static [&'static str],
 }
 
 /// A build directory that is only a candidate next to a marker file.
@@ -144,6 +148,15 @@ pub struct ProjectRule {
     pub regenerate: &'static str,
     /// Why the child is rebuildable.
     pub rationale: &'static str,
+    /// Regular files the tool writes inside the child. One must be present.
+    ///
+    /// A directory that only shares the name is not the tool's output. Empty
+    /// means the name and the markers next to it are the whole check.
+    pub inside_any: &'static [&'static str],
+    /// Names of lock files the tool holds while it writes the child.
+    ///
+    /// They are looked for one and two levels inside the child.
+    pub locks: &'static [&'static str],
 }
 
 /// Safe caches younger than this are not staged.
@@ -176,6 +189,24 @@ const fn cache(
         min_age: HOT_WINDOW,
         regenerate: Some(regenerate),
         rationale,
+        locks: &[],
+    }
+}
+
+/// Cargo takes an exclusive `flock` on these while it downloads or unpacks.
+///
+/// Both exist in a `CARGO_HOME` that cargo has used. The directory itself is
+/// never locked, so probing only the candidate sees nothing.
+const CARGO_HOME_LOCKS: &[&str] = &[".cargo/.package-cache", ".cargo/.package-cache-mutate"];
+
+const fn cargo_cache(id: &'static str, path: &'static str, rationale: &'static str) -> SafeRule {
+    SafeRule {
+        id,
+        anchor: SafeAnchor::Directory(path),
+        min_age: HOT_WINDOW,
+        regenerate: Some("cargo fetch"),
+        rationale,
+        locks: CARGO_HOME_LOCKS,
     }
 }
 
@@ -186,6 +217,7 @@ const fn aged_files(id: &'static str, path: &'static str, min_age: Duration) -> 
         min_age,
         regenerate: None,
         rationale: "aged files in a tool directory; the directory itself stays",
+        locks: &[],
     }
 }
 
@@ -201,16 +233,14 @@ const fn aged_files(id: &'static str, path: &'static str, min_age: Duration) -> 
 #[must_use]
 pub fn builtin_safe() -> Vec<SafeRule> {
     vec![
-        cache(
+        cargo_cache(
             "cargo-registry",
             ".cargo/registry",
-            "cargo fetch",
             "crate downloads; cargo fetch refills the registry",
         ),
-        cache(
+        cargo_cache(
             "cargo-git",
             ".cargo/git",
-            "cargo fetch",
             "git dependency checkouts; cargo fetch refills them",
         ),
         cache(
@@ -297,6 +327,8 @@ struct ProjectParts {
     require_any: &'static [&'static str],
     regenerate: &'static str,
     rationale: &'static str,
+    inside_any: &'static [&'static str],
+    locks: &'static [&'static str],
 }
 
 const PYTHON_MARKERS: &[&str] = &["pyproject.toml", "setup.cfg", "requirements.txt"];
@@ -310,6 +342,8 @@ const fn project(parts: ProjectParts) -> ProjectRule {
         min_age: CAUTION_AGE,
         regenerate: parts.regenerate,
         rationale: parts.rationale,
+        inside_any: parts.inside_any,
+        locks: parts.locks,
     }
 }
 
@@ -334,6 +368,10 @@ pub fn builtin_project() -> Vec<ProjectRule> {
             require_any: &[],
             regenerate: "cargo build",
             rationale: "cargo build output next to Cargo.toml",
+            // Cargo writes both at the top of every target directory it creates.
+            inside_any: &["CACHEDIR.TAG", ".rustc_info.json"],
+            // Held for the length of a build, in `debug/`, `release/`, or `<triple>/debug/`.
+            locks: &[".cargo-lock"],
         }),
         project(ProjectParts {
             id: "node-modules",
@@ -348,6 +386,8 @@ pub fn builtin_project() -> Vec<ProjectRule> {
             ],
             regenerate: "reinstall from the lockfile",
             rationale: "installed packages next to a lockfile",
+            inside_any: &[],
+            locks: &[],
         }),
         project(ProjectParts {
             id: "next-build",
@@ -356,6 +396,8 @@ pub fn builtin_project() -> Vec<ProjectRule> {
             require_any: &[],
             regenerate: "next build",
             rationale: "Next.js build output",
+            inside_any: &[],
+            locks: &[],
         }),
         project(ProjectParts {
             id: "turbo-cache",
@@ -364,6 +406,8 @@ pub fn builtin_project() -> Vec<ProjectRule> {
             require_any: &["package.json", "turbo.json"],
             regenerate: "turbo refills the cache",
             rationale: "Turborepo cache",
+            inside_any: &[],
+            locks: &[],
         }),
         project(ProjectParts {
             id: "pycache",
@@ -372,6 +416,8 @@ pub fn builtin_project() -> Vec<ProjectRule> {
             require_any: PYTHON_MARKERS,
             regenerate: "python recreates bytecode",
             rationale: "python bytecode",
+            inside_any: &[],
+            locks: &[],
         }),
         project(ProjectParts {
             id: "pytest-cache",
@@ -380,6 +426,8 @@ pub fn builtin_project() -> Vec<ProjectRule> {
             require_any: PYTHON_MARKERS,
             regenerate: "pytest recreates the cache",
             rationale: "pytest cache",
+            inside_any: &[],
+            locks: &[],
         }),
         project(ProjectParts {
             id: "mypy-cache",
@@ -388,6 +436,8 @@ pub fn builtin_project() -> Vec<ProjectRule> {
             require_any: PYTHON_MARKERS,
             regenerate: "mypy recreates the cache",
             rationale: "mypy cache",
+            inside_any: &[],
+            locks: &[],
         }),
         project(ProjectParts {
             id: "ruff-cache",
@@ -396,6 +446,8 @@ pub fn builtin_project() -> Vec<ProjectRule> {
             require_any: PYTHON_MARKERS,
             regenerate: "ruff recreates the cache",
             rationale: "ruff cache",
+            inside_any: &[],
+            locks: &[],
         }),
     ]
 }
