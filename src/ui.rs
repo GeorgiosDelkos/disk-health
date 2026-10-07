@@ -14,8 +14,8 @@
 //! other reason. The usage screen has no stage key.
 //!
 //! The scan, the review inventory, a usage walk, and an apply each run on
-//! their own thread and report over one channel. The UI thread never waits
-//! on the disk, so it can always paint and always quit. Quitting during an
+//! their own thread and report over one channel. The UI thread does not
+//! walk or rename anything, so it can always paint and always quit. Quitting during an
 //! apply stops it between entries and waits for its report.
 
 use std::fmt::Write as _;
@@ -132,28 +132,23 @@ pub enum Filter {
 
 /// How a finished scan went, for the title and the status line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ScanSummary {
+struct ScanSummary {
     /// Entries the scan could not read.
-    pub unreadable: u64,
+    unreadable: u64,
     /// Project roots that do not exist.
-    pub roots_missing: usize,
-    /// Project roots on the denylist.
-    pub roots_denied: usize,
+    roots_missing: usize,
+    /// Project roots on the denylist or on another volume.
+    roots_denied: usize,
     /// Why the scan stopped early, when it did.
-    pub failed: Option<String>,
+    failed: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScanState {
     Running,
     Done,
-}
-
-/// Work running off the UI thread. The status line shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Busy {
-    Walking { mount: PathBuf },
-    Applying,
+    /// Stopped early. The title keeps saying so after the message is gone.
+    Failed,
 }
 
 /// Order of the reclaim groups.
@@ -239,7 +234,13 @@ pub struct Model {
     order: Order,
     walk_dirs: u64,
 
-    busy: Option<Busy>,
+    /// Mount a usage walk is reading, on another thread.
+    walking: Option<PathBuf>,
+    /// An apply is running on another thread. Separate from the walk: the
+    /// two can overlap, and neither may forget the other.
+    applying: bool,
+    /// What the last apply did. Printed again after the UI leaves.
+    applied: Option<String>,
     mode: Mode,
     message: String,
     /// Bumped on every change the screen shows. The driver skips a paint
@@ -297,7 +298,9 @@ impl Model {
             usage_path: Vec::new(),
             order: Order::Size,
             walk_dirs: 0,
-            busy: None,
+            walking: None,
+            applying: false,
+            applied: None,
             mode: Mode::Browse,
             message: String::new(),
             revision: 1,
@@ -370,22 +373,43 @@ impl Model {
     ///
     /// A second finding with the same rule and path replaces the first.
     pub fn push_finding(&mut self, finding: Finding) {
-        let anchor = self.anchor();
-        let path = finding.path.clone();
-        let rule = finding.rule;
+        self.push_findings(vec![finding]);
+    }
 
-        if let Some(row) = self
-            .rows
-            .iter_mut()
-            .find(|row| row.rule == rule && row.path == path)
-        {
-            *row = row_from_finding(finding, self.now);
-        } else {
-            self.rows.push(row_from_finding(finding, self.now));
+    /// Appends a batch of findings and restores the cursor once.
+    ///
+    /// If a total is being typed and the batch changes what is staged, the
+    /// prompt is cancelled. The total on screen when typing began would no
+    /// longer be the total of what Enter moves, and to one decimal place a
+    /// new row can hide inside it.
+    fn push_findings(&mut self, findings: Vec<Finding>) {
+        let anchor = self.anchor();
+        let staged = self.staged_mark();
+
+        for finding in findings {
+            let existing = self
+                .rows
+                .iter_mut()
+                .find(|row| row.rule == finding.rule && row.path == finding.path);
+            match existing {
+                Some(row) => *row = row_from_finding(finding, self.now),
+                None => self.rows.push(row_from_finding(finding, self.now)),
+            }
         }
 
         self.restore_anchor(anchor);
+        if self.mode == Mode::Confirm && self.staged_mark() != staged {
+            self.mode = Mode::Browse;
+            self.typed.clear();
+            self.say("the staged rows changed; press t again");
+        }
         self.bump();
+    }
+
+    /// How many rows are staged and their exact bytes.
+    fn staged_mark(&self) -> (usize, u64) {
+        let count = self.rows.iter().filter(|row| row.staged).count();
+        (count, self.staged_bytes())
     }
 
     /// Replaces review rows. Finding rows stay, including their staged bits.
@@ -398,7 +422,7 @@ impl Model {
     }
 
     /// Records how far the scan's project walk has come.
-    pub fn set_scan_progress(&mut self, dirs: u64) {
+    fn set_scan_progress(&mut self, dirs: u64) {
         if self.scan_dirs != dirs {
             self.scan_dirs = dirs;
             self.bump();
@@ -406,8 +430,12 @@ impl Model {
     }
 
     /// Marks the scan finished and reports what it could not do.
-    pub fn finish_scan(&mut self, summary: &ScanSummary) {
-        self.scan = ScanState::Done;
+    fn finish_scan(&mut self, summary: &ScanSummary) {
+        self.scan = if summary.failed.is_some() {
+            ScanState::Failed
+        } else {
+            ScanState::Done
+        };
         if let Some(note) = scan_note(summary) {
             self.message = note;
         }
@@ -415,47 +443,52 @@ impl Model {
     }
 
     /// Notes that a usage walk of `mount` is running elsewhere.
-    pub fn begin_walk(&mut self, mount: PathBuf) {
+    fn begin_walk(&mut self, mount: PathBuf) {
         self.message.clear();
-        self.busy = Some(Busy::Walking { mount });
+        self.walking = Some(mount);
         self.walk_dirs = 0;
         self.bump();
     }
 
     /// Records how many directories the usage walk has expanded.
-    pub fn set_walk_progress(&mut self, dirs: u64) {
-        if self.walk_dirs != dirs && matches!(self.busy, Some(Busy::Walking { .. })) {
+    fn set_walk_progress(&mut self, dirs: u64) {
+        if self.walk_dirs != dirs && self.walking.is_some() {
             self.walk_dirs = dirs;
             self.bump();
         }
     }
 
-    /// Shows a usage tree and switches to that screen.
+    /// Stores a usage tree, and shows it if the operator is still waiting
+    /// on the volumes screen.
     pub fn set_usage(&mut self, node: UsageNode) {
         self.end_walk();
         self.usage = Some(node);
         self.usage_path.clear();
         self.usage_cursor = 0;
-        self.screen = Screen::Usage;
         self.sort_current();
+        // The walk can take minutes. Whoever started it may be typing a
+        // total by now, and the screen must not change under that.
+        if self.mode == Mode::Browse && self.screen == Screen::Volumes {
+            self.screen = Screen::Usage;
+        } else {
+            self.say("the usage walk finished; press 3 to see it");
+        }
         self.bump();
     }
 
     /// Reports a usage walk that did not produce a tree.
-    pub fn fail_walk(&mut self, message: impl Into<String>) {
+    fn fail_walk(&mut self, message: impl Into<String>) {
         self.end_walk();
         self.set_message(message);
     }
 
     fn end_walk(&mut self) {
-        if matches!(self.busy, Some(Busy::Walking { .. })) {
-            self.busy = None;
-        }
+        self.walking = None;
     }
 
     /// Notes that an apply is running elsewhere. Keys other than `q` wait.
-    pub fn begin_apply(&mut self) {
-        self.busy = Some(Busy::Applying);
+    fn begin_apply(&mut self) {
+        self.applying = true;
         self.message.clear();
         self.mode = Mode::Browse;
         self.typed.clear();
@@ -463,16 +496,15 @@ impl Model {
     }
 
     /// Whether an apply is running. The caller must not quit while it is.
-    #[must_use]
-    pub fn applying(&self) -> bool {
-        self.busy == Some(Busy::Applying)
+    fn applying(&self) -> bool {
+        self.applying
     }
 
     /// Takes moved rows off the list and marks the ones that stayed.
     ///
     /// A row that was skipped is no longer staged, so the total in the title
     /// is again what a confirm would move.
-    pub fn finish_apply(&mut self, report: &ApplyReport) {
+    fn finish_apply(&mut self, report: &ApplyReport) {
         let anchor = self.anchor();
         let mut bytes: u64 = 0;
         self.rows.retain(|row| {
@@ -492,16 +524,18 @@ impl Model {
             }
         }
 
-        self.busy = None;
+        self.applying = false;
         self.restore_anchor(anchor);
         self.message = apply_note(report, bytes);
+        self.applied = Some(self.message.clone());
         self.bump();
     }
 
     /// Reports an apply that returned an error. Nothing was renamed.
-    pub fn fail_apply(&mut self, message: impl Into<String>) {
-        self.busy = None;
+    fn fail_apply(&mut self, message: impl Into<String>) {
+        self.applying = false;
         self.set_message(message);
+        self.applied = Some(self.message.clone());
     }
 
     /// Sets the render width. A resize redraws from this snapshot.
@@ -517,7 +551,7 @@ impl Model {
     }
 
     /// Sets the directory shown as `~` in paths.
-    pub fn set_home(&mut self, home: &Path) {
+    fn set_home(&mut self, home: &Path) {
         self.home = Some(home.to_path_buf());
         self.bump();
     }
@@ -639,7 +673,7 @@ impl Model {
             self.message = format!("not walkable: {}", volume.mount.display());
             return Effect::None;
         }
-        if let Some(Busy::Walking { mount }) = &self.busy {
+        if let Some(mount) = &self.walking {
             self.message = format!("still walking {}", mount.display());
             return Effect::None;
         }
@@ -746,9 +780,21 @@ impl Model {
     }
 
     fn ascend(&mut self) {
-        if let Some(index) = self.usage_path.pop() {
-            self.usage_cursor = index;
+        let left = node_at(self.usage.as_ref(), &self.usage_path).map(|node| node.path.clone());
+        if self.usage_path.pop().is_none() {
+            return;
         }
+        // `s` only sorts the directory on screen, so the parent may still
+        // be in the other order. Sort it, then find the child by name.
+        self.sort_current();
+        let siblings = node_at(self.usage.as_ref(), &self.usage_path);
+        self.usage_cursor = siblings
+            .and_then(|node| {
+                node.children
+                    .iter()
+                    .position(|child| Some(&child.path) == left.as_ref())
+            })
+            .unwrap_or(0);
     }
 
     fn sort_current(&mut self) {
@@ -968,6 +1014,11 @@ fn escape_sequence(bytes: &[u8]) -> (Option<Key>, &[u8]) {
     let Some(last) = bytes.get(params) else {
         return (None, &[]);
     };
+    // Not a final byte, so this was not a sequence. Drop what was read of it
+    // and let the byte be decoded as itself.
+    if !(0x40..=0x7e).contains(last) {
+        return (None, &bytes[params..]);
+    }
 
     let key = match (&bytes[..params], *last) {
         (b"", b'A') => Some(Key::Up),
@@ -1015,16 +1066,21 @@ pub fn render(model: &Model) -> String {
     let mut foot = vec![String::new(), footer_line(model)];
     foot.extend(message_line(model));
 
-    let budget = model
-        .term_rows
-        .saturating_sub(head.len() + foot.len())
-        .max(1);
+    // The bottom lines win on a short terminal. The confirm prompt is
+    // there, and a prompt that takes keys without being drawn is worse than
+    // a list that is cut. The meter above the list goes first.
+    let foot = foot.split_off(foot.len().saturating_sub(model.term_rows));
+    let above = model.term_rows - foot.len();
+    if head.len() >= above {
+        head.truncate(2.min(above));
+    }
+
     let mut lines = head;
-    lines.extend(viewport(body, focus, budget));
+    let budget = above - lines.len();
+    if budget > 0 {
+        lines.extend(viewport(body, focus, budget));
+    }
     lines.extend(foot);
-    // A terminal shorter than the title and footer still gets a frame that
-    // fits. One line too many scrolls the whole screen.
-    lines.truncate(model.term_rows);
     lines.join("\n")
 }
 
@@ -1060,7 +1116,23 @@ pub fn run(session: &Session<'_>) -> crate::Result<i32> {
             message: message.to_owned(),
         });
     }
-    drive(session)
+    if let Some(note) = drive(session)? {
+        print_note(&note);
+    }
+    Ok(0)
+}
+
+/// Repeats what the last apply did, once the terminal is the shell's again.
+///
+/// Leaving the alternate screen takes the UI's last frame with it. A stopped
+/// apply reports in that frame and nowhere else, and "not logged, restore by
+/// hand" has to outlive it.
+#[allow(
+    clippy::print_stdout,
+    reason = "the apply result is the command's output"
+)]
+fn print_note(note: &str) {
+    println!("{note}");
 }
 
 /// Inputs for [`run`]. The terminal flags are explicit so tests do not read
@@ -1079,6 +1151,9 @@ pub struct Session<'a> {
     pub home: &'a Path,
 }
 
+/// Events taken off the channel between two reads of the keyboard.
+const MAX_EVENTS_PER_TICK: usize = 512;
+
 /// What a background thread hands back to the UI thread.
 enum Event {
     Finding(Finding),
@@ -1092,13 +1167,33 @@ enum Event {
 /// keys, takes events, and paints, so `q` always answers.
 struct Background {
     home: PathBuf,
+    /// Recorded in a plan. Looked up once, off the key path.
+    host: String,
     loaded: Arc<Loaded>,
     events: mpsc::Sender<Event>,
     scan_dirs: Arc<AtomicU64>,
     walk_dirs: Arc<AtomicU64>,
+    /// The one thread that renames. Joined before the driver returns.
+    apply: Option<std::thread::JoinHandle<()>>,
 }
 
-fn drive(session: &Session<'_>) -> crate::Result<i32> {
+impl Drop for Background {
+    /// Waits for a running apply on every way out of the driver, including
+    /// an error from the terminal. The process exiting between a rename and
+    /// its log line would leave a move that `restore` cannot find.
+    fn drop(&mut self) {
+        let Some(apply) = self.apply.take() else {
+            return;
+        };
+        // `Release`: pairs with the `Acquire` load the apply loop makes
+        // between entries. The flag guards no other data.
+        crate::tty::interrupt_flag().store(true, Ordering::Release);
+        // A panic in the apply thread has already been reported by the hook.
+        let _ = apply.join();
+    }
+}
+
+fn drive(session: &Session<'_>) -> crate::Result<Option<String>> {
     let loaded = crate::config::load(session.home)?;
     let (roots, denied) = crate::config::prepare_roots(&loaded.roots, &loaded.deny)?;
     let home_dev = crate::walk::RealFs.meta(session.home)?.dev;
@@ -1118,25 +1213,29 @@ fn drive(session: &Session<'_>) -> crate::Result<i32> {
         .map_err(|source| crate::Error::io("install signals", "/dev/tty", source))?;
 
     let (events, inbox) = mpsc::channel();
-    let background = Background {
+    let mut background = Background {
         home: session.home.to_path_buf(),
+        host: hostname(),
         loaded: Arc::new(loaded),
         events,
         scan_dirs: Arc::new(AtomicU64::new(0)),
         walk_dirs: Arc::new(AtomicU64::new(0)),
+        apply: None,
     };
-    // Detached on purpose. Quitting must not wait for a walk of a large volume.
+    // Detached on purpose. They only read, and quitting must not wait for a
+    // walk of a large volume.
     background.spawn_scan(roots, denied.len());
     background.spawn_review();
 
     // `read_input` times out ten times a second. Painting an unchanged
     // frame at that rate flickers, so the revision has to move first.
     let mut drawn = 0;
+    let mut pending = Pending::default();
     loop {
         // An apply is told to stop by the same flag and reports back. Leaving
         // before it does would drop the rows it skipped.
         if crate::tty::interrupted() && !model.applying() {
-            return Ok(0);
+            return Ok(model.applied.take());
         }
         background.deliver(&mut model, &inbox);
         if crate::tty::take_resized()
@@ -1150,17 +1249,54 @@ fn drive(session: &Session<'_>) -> crate::Result<i32> {
             drawn = model.revision;
         }
 
-        let Some(bytes) = crate::tty::read_input(0)
-            .map_err(|source| crate::Error::io("read key", "/dev/tty", source))?
-        else {
-            continue;
-        };
-        for key in decode(&bytes) {
+        let bytes = crate::tty::read_input(0)
+            .map_err(|source| crate::Error::io("read key", "/dev/tty", source))?;
+        for key in pending.take(bytes.as_deref()) {
             if background.act(&mut model, key) {
-                return Ok(0);
+                return Ok(model.applied.take());
             }
         }
     }
+}
+
+/// Bytes read from the terminal that do not yet make a whole key.
+///
+/// A read can end in the middle of an escape sequence. Decoding it there
+/// turns an arrow key into Escape followed by two letters, and Escape
+/// cancels a prompt.
+#[derive(Default)]
+struct Pending(Vec<u8>);
+
+impl Pending {
+    /// Adds a read and returns the keys that are complete. `None` is a read
+    /// that timed out: nothing more is coming, so what is held is the key.
+    fn take(&mut self, read: Option<&[u8]>) -> Vec<Key> {
+        let whole = match read {
+            Some(bytes) => {
+                self.0.extend_from_slice(bytes);
+                whole_prefix(&self.0)
+            }
+            None => self.0.len(),
+        };
+        let keys = decode(&self.0[..whole]);
+        self.0.drain(..whole);
+        keys
+    }
+}
+
+/// Length of the part of `bytes` that does not end inside an escape sequence.
+fn whole_prefix(bytes: &[u8]) -> usize {
+    let Some(start) = bytes.iter().rposition(|byte| *byte == 0x1b) else {
+        return bytes.len();
+    };
+    let unfinished = match &bytes[start + 1..] {
+        // A lone ESC is the Escape key, or the start of a sequence whose
+        // rest is in the next read. A timed-out read settles which.
+        [] => true,
+        [b'[' | b'O', rest @ ..] => rest.iter().all(|byte| (0x20..=0x3f).contains(byte)),
+        _ => false,
+    };
+    if unfinished { start } else { bytes.len() }
 }
 
 fn paint_frame(model: &Model) -> crate::Result<()> {
@@ -1170,21 +1306,39 @@ fn paint_frame(model: &Model) -> crate::Result<()> {
 
 /// The frame as terminal output, after the cursor is homed.
 ///
-/// Each line erases to its end, and everything below the frame is erased,
-/// so a shorter frame leaves nothing of the previous one. Lines are joined,
-/// not terminated: a newline after the last row of a full screen scrolls it
-/// and the title is gone.
+/// Each line is erased before it is written, so nothing of a longer line
+/// from the previous frame is left. Erasing after the text would start from
+/// the pending-wrap position of a full-width line, and some terminals erase
+/// the last cell there. Lines are joined, not terminated: a newline after
+/// the last row of a full screen scrolls it and the title is gone.
 fn frame_bytes(model: &Model) -> String {
-    let mut painted = render(model).replace('\n', "\u{1b}[K\r\n");
-    painted.push_str("\u{1b}[K\u{1b}[J");
+    let frame = render(model);
+    let mut painted = String::new();
+    let mut lines = 0;
+    for line in frame.split('\n') {
+        if lines > 0 {
+            painted.push_str("\r\n");
+        }
+        painted.push_str("\u{1b}[K");
+        painted.push_str(line);
+        lines += 1;
+    }
+    // Only when there are rows below the frame. On a full screen the erase
+    // would begin at that same pending-wrap position.
+    if lines < model.term_rows {
+        painted.push_str("\r\n\u{1b}[J");
+    }
     painted
 }
 
 impl Background {
     fn deliver(&self, model: &mut Model, inbox: &mpsc::Receiver<Event>) {
-        while let Ok(event) = inbox.try_recv() {
+        // Bounded, so a scan that finds thousands of rows cannot keep the
+        // loop from reading a key. The rest waits a tenth of a second.
+        let mut found = Vec::new();
+        for event in inbox.try_iter().take(MAX_EVENTS_PER_TICK) {
             match event {
-                Event::Finding(finding) => model.push_finding(finding),
+                Event::Finding(finding) => found.push(finding),
                 Event::ScanDone(summary) => model.finish_scan(&summary),
                 Event::Review(items) => model.set_review(items),
                 Event::Usage(Ok(tree)) => model.set_usage(tree),
@@ -1193,17 +1347,22 @@ impl Background {
                 Event::Applied(Err(message)) => model.fail_apply(message),
             }
         }
+        if !found.is_empty() {
+            model.push_findings(found);
+        }
         // `Relaxed`: these are counters for the status line and publish nothing else.
         model.set_scan_progress(self.scan_dirs.load(Ordering::Relaxed));
         model.set_walk_progress(self.walk_dirs.load(Ordering::Relaxed));
     }
 
     /// Applies one key. `true` means leave.
-    fn act(&self, model: &mut Model, key: Key) -> bool {
+    fn act(&mut self, model: &mut Model, key: Key) -> bool {
         match model.handle(key) {
             Effect::Quit => return true,
             Effect::None => {}
             Effect::Interrupt => {
+                // `Release`: pairs with the `Acquire` load the apply loop
+                // makes between entries. The flag guards no other data.
                 crate::tty::interrupt_flag().store(true, Ordering::Release);
             }
             Effect::WalkUsage { mount } => {
@@ -1212,7 +1371,7 @@ impl Background {
             }
             Effect::ConfirmApply { typed } => {
                 // Typed size, not the plan id. `apply` would reject this path.
-                let plan = model.plan(&hostname());
+                let plan = model.plan(&self.host);
                 model.begin_apply();
                 self.spawn_apply(plan, typed);
             }
@@ -1292,14 +1451,37 @@ impl Background {
         });
     }
 
-    fn spawn_apply(&self, plan: Plan, typed: String) {
+    fn spawn_apply(&mut self, plan: Plan, typed: String) {
         let home = self.home.clone();
         let loaded = Arc::clone(&self.loaded);
         let events = self.events.clone();
-        std::thread::spawn(move || {
+        // The model takes no key but `q` while an apply runs, so the handle
+        // this replaces belongs to an apply that already reported.
+        self.apply = Some(std::thread::spawn(move || {
+            let mut reply = Reply(Some(events));
             let report = apply_plan(&home, &loaded, &plan, &typed);
-            let _ = events.send(Event::Applied(report.map_err(|err| err.to_string())));
-        });
+            reply.send(report.map_err(|err| err.to_string()));
+        }));
+    }
+}
+
+/// The apply thread's one message. The UI takes no key but `q` until it
+/// arrives, so a thread that dies without sending it must still send it.
+struct Reply(Option<mpsc::Sender<Event>>);
+
+impl Reply {
+    fn send(&mut self, result: std::result::Result<ApplyReport, String>) {
+        if let Some(events) = self.0.take() {
+            let _ = events.send(Event::Applied(result));
+        }
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        self.send(Err(
+            "the apply stopped without a report; check the action log".to_owned(),
+        ));
     }
 }
 
@@ -1719,7 +1901,7 @@ fn volume_heading(model: &Model, volume: &Volume, selected: bool, heat: Ink, pct
         format_bytes(volume.used_bytes),
         format_bytes(volume.available_bytes),
     );
-    let used = marker.chars().count() + name.chars().count() + stats.chars().count();
+    let used = cells(marker) + cells(&name) + cells(&stats);
     let gap = " ".repeat(gap_width(model.columns, used));
 
     paint_line(
@@ -1765,10 +1947,7 @@ fn usage_body(model: &Model) -> (Vec<String>, usize) {
 fn usage_parent(model: &Model, node: &UsageNode) -> String {
     let path = node.path.display().to_string();
     let size = format_bytes(node.apparent_bytes);
-    let gap = " ".repeat(gap_width(
-        model.columns,
-        path.chars().count() + size.chars().count() + 2,
-    ));
+    let gap = " ".repeat(gap_width(model.columns, cells(&path) + cells(&size) + 2));
 
     paint_line(
         model.palette,
@@ -1828,7 +2007,7 @@ fn usage_child(
     let name = file_label(&child.path);
     let share = pct_text(child.apparent_bytes, parent_bytes);
     let stats = format!("{}  {share}", format_bytes(child.apparent_bytes));
-    let used = marker.chars().count() + name.chars().count() + stats.chars().count();
+    let used = cells(marker) + cells(&name) + cells(&stats);
     let gap = " ".repeat(gap_width(model.columns, used));
     let heading = paint_line(
         model.palette,
@@ -1860,15 +2039,16 @@ fn title_line(model: &Model) -> String {
         Screen::Usage => "usage",
     };
     let left = format!("disk-health  {name}");
-    let scan = match (&model.busy, &model.scan) {
-        (Some(Busy::Walking { mount }), _) => {
+    let scan = match (&model.walking, &model.scan) {
+        (Some(mount), _) => {
             format!("walking {}  {} dirs", mount.display(), model.walk_dirs)
         }
         (_, ScanState::Running) => format!("scanning  {} dirs", model.scan_dirs),
         (_, ScanState::Done) => "scan done".to_owned(),
+        (_, ScanState::Failed) => "scan failed".to_owned(),
     };
     let staged = format!("   staged {}", format_bytes(model.staged_bytes()));
-    let used = left.chars().count() + scan.chars().count() + staged.chars().count();
+    let used = cells(&left) + cells(&scan) + cells(&staged);
     let gap = " ".repeat(gap_width(model.columns, used));
 
     paint_line(
@@ -1885,7 +2065,6 @@ fn title_line(model: &Model) -> String {
 
 fn help_body(model: &Model) -> Vec<String> {
     const LINES: &[&str] = &[
-        "",
         "  everywhere",
         "    1 2 3, tab     switch screen",
         "    j k, arrows    move          g G, home end   first, last",
@@ -1904,7 +2083,6 @@ fn help_body(model: &Model) -> Vec<String> {
         "  usage",
         "    enter, right   open a directory   backspace, left   go up",
         "    s              sort by size or by name",
-        "",
         "  any key closes this",
     ];
     LINES
@@ -1940,6 +2118,7 @@ fn reclaim_body(model: &Model) -> (Vec<String>, usize) {
         let text = match model.scan {
             ScanState::Running => "  no reclaim rows yet",
             ScanState::Done => "  nothing to reclaim",
+            ScanState::Failed => "  the scan failed before it found anything",
         };
         return (vec![text.to_owned()], 0);
     }
@@ -2021,7 +2200,7 @@ fn reclaim_line(model: &Model, row: &Row, selected: bool, total: u64) -> String 
         &[(marker, marker_ink), (size.as_str(), size_ink)],
         model.columns,
     );
-    let mut used = marker.chars().count() + size.chars().count();
+    let mut used = cells(marker) + cells(&size);
 
     if model.columns >= ROW_BAR_MIN_COLUMNS {
         let filled = magnitude(row.bytes, total, ROW_BAR);
@@ -2047,7 +2226,7 @@ fn reclaim_line(model: &Model, row: &Row, selected: bool, total: u64) -> String 
         format!("{:>5}  ", age_text(row.age))
     };
     let left = model.columns.saturating_sub(used);
-    let taken = state.chars().count() + facts.chars().count();
+    let taken = cells(&state) + cells(&facts);
     let path = short_tail(&shown_path(model, &row.path), left.saturating_sub(taken));
     line.push_str(&paint_line(
         model.palette,
@@ -2070,12 +2249,10 @@ fn detail_lines(model: &Model, row: &Row) -> Vec<String> {
 
     let mut lines = Vec::new();
     for text in [path.as_str(), rule.as_str(), row.detail.as_str()] {
-        let chars = text.chars().collect::<Vec<_>>();
-        for chunk in chars.chunks(width) {
-            let chunk = chunk.iter().collect::<String>();
+        for piece in wrapped(&printable(text), width) {
             lines.push(paint_line(
                 model.palette,
-                &[(INDENT, Ink::Text), (chunk.as_str(), Ink::Muted)],
+                &[(INDENT, Ink::Text), (piece.as_str(), Ink::Muted)],
                 model.columns,
             ));
         }
@@ -2140,9 +2317,9 @@ fn footer_line(model: &Model) -> String {
 
     // The position keeps its place. The key list is what gets cut, and `?`
     // has all of it.
-    let room = model.columns.saturating_sub(position.chars().count() + 1);
+    let room = model.columns.saturating_sub(cells(&position) + 1);
     let left = fit(&format!("{keys}  ? help  q quit"), room);
-    let used = left.chars().count() + position.chars().count();
+    let used = cells(&left) + cells(&position);
     let gap = " ".repeat(gap_width(model.columns, used));
     paint_line(
         model.palette,
@@ -2301,22 +2478,66 @@ fn indent_meter(meter: &str) -> String {
     format!("  {meter}")
 }
 
-fn paint_line(palette: Palette, pieces: &[(&str, Ink)], width: usize) -> String {
-    let mut left = width;
+fn paint_line(palette: Palette, pieces: &[(&str, Ink)], columns: usize) -> String {
+    let mut left = columns;
     let mut out = String::new();
     for (text, ink) in pieces {
         if left == 0 {
             break;
         }
-        let fitted = fit(text, left);
-        let taken = fitted.chars().count();
+        let text = printable(text);
+        let fitted = fit(&text, left);
+        let taken = cells(&fitted);
         out.push_str(&paint_fg(palette, *ink, &fitted));
         left = left.saturating_sub(taken);
-        if taken < text.chars().count() {
+        if taken < cells(&text) {
             break;
         }
     }
     out
+}
+
+/// `text` with every control character replaced.
+///
+/// A file name can hold an escape sequence or a newline. Written as is, it
+/// could move the cursor, clear the screen, or draw a line that looks like
+/// the confirm prompt. Every path on screen goes through [`paint_line`].
+fn printable(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(char::is_control) {
+        text.chars()
+            .map(|ch| if ch.is_control() { '?' } else { ch })
+            .collect::<String>()
+            .into()
+    } else {
+        text.into()
+    }
+}
+
+/// Terminal cells `text` takes.
+fn cells(text: &str) -> usize {
+    text.chars().map(char_cells).sum()
+}
+
+/// Cells one character takes: 2 for East Asian wide and emoji, 0 for
+/// combining marks and joiners, 1 otherwise.
+///
+/// The ranges are the wide and zero-width blocks that turn up in file
+/// names. A character outside them that a terminal draws wide makes a line
+/// one cell too long.
+fn char_cells(ch: char) -> usize {
+    match u32::from(ch) {
+        0x0300..=0x036F | 0x200B..=0x200F | 0xFE00..=0xFE0F => 0,
+        0x1100..=0x115F
+        | 0x2E80..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1FAFF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
 }
 
 fn paint_fg(palette: Palette, ink: Ink, text: &str) -> String {
@@ -2482,17 +2703,24 @@ fn file_label(path: &Path) -> String {
 }
 
 /// Keeps the end of `text`, which is the part of a path that tells rows apart.
-fn short_tail(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
+fn short_tail(text: &str, columns: usize) -> String {
+    if cells(text) <= columns {
         return text.to_owned();
     }
-    if width <= 1 {
+    if columns <= 1 {
         return String::new();
     }
 
-    let tail = text.chars().skip(count - (width - 1)).collect::<String>();
-    format!("…{tail}")
+    let mut kept = Vec::new();
+    let mut used = 1;
+    for ch in text.chars().rev() {
+        used += char_cells(ch);
+        if used > columns {
+            break;
+        }
+        kept.push(ch);
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
 }
 
 fn age_text(age: Option<Duration>) -> String {
@@ -2507,17 +2735,43 @@ fn age_text(age: Option<Duration>) -> String {
     }
 }
 
-fn fit(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
+fn fit(text: &str, columns: usize) -> String {
+    if cells(text) <= columns {
         return text.to_owned();
     }
-    if width <= 1 {
+    if columns <= 1 {
         return String::new();
     }
-    let mut out: String = text.chars().take(width - 1).collect();
+
+    let mut out = String::new();
+    let mut used = 1;
+    for ch in text.chars() {
+        used += char_cells(ch);
+        if used > columns {
+            break;
+        }
+        out.push(ch);
+    }
     out.push('…');
     out
+}
+
+/// `text` cut into pieces of at most `columns` cells.
+fn wrapped(text: &str, columns: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    let mut used = 0;
+    for ch in text.chars() {
+        let wide = char_cells(ch);
+        if used + wide > columns && used > 0 {
+            lines.push(String::new());
+            used = 0;
+        }
+        if let Some(line) = lines.last_mut() {
+            line.push(ch);
+        }
+        used += wide;
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -2669,6 +2923,7 @@ mod tests {
         });
         assert_eq!(model.handle(Key::Char(' ')), Effect::None);
         assert_eq!(model.handle(Key::Char('t')), Effect::None);
+        assert!(!render(&model).contains("confirm"), "{}", render(&model));
         assert!(!model.is_staged(Path::new("/proj/target")));
         model.handle(Key::Enter);
         model.handle(Key::Backspace);
@@ -2884,10 +3139,15 @@ mod tests {
             UNIX_EPOCH,
         );
         model.handle(Key::Char('2'));
-        for path in ["/a/target", "/b/target", "/c/target"] {
+        let refused = [
+            ("/a/target", "held: git tree is dirty"),
+            ("/b/target", "held: another process holds a file lock"),
+            ("/c/target", "held: could not read every entry"),
+        ];
+        for (path, why) in refused {
             model.handle(Key::Char(' '));
             assert!(!model.is_staged(Path::new(path)), "{path}");
-            assert!(render(&model).contains("held: "), "{}", render(&model));
+            assert!(render(&model).contains(why), "{}", render(&model));
             model.handle(Key::Down);
         }
         model.handle(Key::Char(' '));
@@ -2958,9 +3218,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_full_frame_fits_the_terminal_and_does_not_scroll_it() {
-        let findings = (0..40u64)
+    /// A model with every kind of row, a usage tree, and names that are
+    /// hostile to a terminal: wide characters, an escape sequence, a newline.
+    fn crowded_model() -> Model {
+        let mut findings = (0..40u64)
             .map(|index| {
                 finding(
                     Tier::Safe,
@@ -2969,19 +3230,243 @@ mod tests {
                     true,
                 )
             })
-            .collect();
-        let mut model = Model::new(Vec::new(), findings, Vec::new(), Palette::Plain, UNIX_EPOCH);
+            .collect::<Vec<_>>();
+        findings.push(held(
+            Tier::Caution,
+            "/h/日本語のプロジェクト/ターゲット/target",
+            Skip::Dirty,
+        ));
+        findings.push(held(
+            Tier::Caution,
+            "/h/a\u{1b}[2J\nb\nc/target",
+            Skip::Young,
+        ));
+        let mut model = Model::new(
+            vec![volume("/Data", true), volume("/System", false)],
+            findings,
+            vec![review("/sessions")],
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.set_usage(UsageNode {
+            path: PathBuf::from("/vol"),
+            apparent_bytes: 100,
+            children: vec![
+                UsageNode {
+                    path: PathBuf::from("/vol/x\u{1b}]0;pwned\u{7}"),
+                    apparent_bytes: 60,
+                    children: Vec::new(),
+                },
+                UsageNode {
+                    path: PathBuf::from("/vol/写真"),
+                    apparent_bytes: 40,
+                    children: Vec::new(),
+                },
+            ],
+        });
+        model
+    }
+
+    #[test]
+    fn no_frame_is_taller_or_wider_than_the_terminal_or_holds_a_control_character() {
+        // Each prefix leaves the model on another screen or in another mode.
+        let scripts: [&[Key]; 7] = [
+            &[Key::Char('1'), Key::Char('a')],
+            &[Key::Char('2')],
+            &[Key::Char('2'), Key::End, Key::Char('d')],
+            &[Key::Char('2'), Key::Char('t'), Key::Char('9')],
+            &[Key::Char('2'), Key::Char('t'), Key::Char('9'), Key::Enter],
+            &[Key::Char('3')],
+            &[Key::Char('?')],
+        ];
+        for keys in scripts {
+            let mut model = crowded_model();
+            for key in keys {
+                model.handle(*key);
+            }
+            for (columns, rows) in [(1, 1), (7, 2), (20, 3), (40, 9), (80, 24), (131, 45)] {
+                model.set_columns(columns);
+                model.set_rows(rows);
+                let frame = render(&model);
+                assert!(
+                    !frame.contains(|ch: char| ch.is_control() && ch != '\n'),
+                    "{keys:?}"
+                );
+                let lines = frame.split('\n').collect::<Vec<_>>();
+                assert!(
+                    lines.len() <= rows,
+                    "{keys:?} at {columns}x{rows}:\n{frame}"
+                );
+                for line in lines {
+                    assert!(
+                        cells(line) <= columns,
+                        "{keys:?} at {columns}x{rows}: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_frame_does_not_scroll_the_terminal() {
+        let mut model = crowded_model();
         model.handle(Key::Char('2'));
         for rows in [1, 3, 12, 24] {
             model.set_rows(rows);
-            assert_eq!(render(&model).split('\n').count(), rows.min(24), "{rows}");
+            assert_eq!(render(&model).split('\n').count(), rows, "{rows}");
 
             // A newline after the last row would scroll a full screen and
             // push the title off the top.
             let painted = frame_bytes(&model);
             assert_eq!(painted.matches("\r\n").count(), rows - 1, "{rows}");
-            assert!(painted.ends_with("\u{1b}[K\u{1b}[J"));
+            assert!(!painted.contains("\u{1b}[J"), "{rows}");
         }
+
+        // A frame shorter than the screen erases what is below it.
+        let mut model = volume_model(10, Palette::Plain);
+        model.set_rows(30);
+        assert!(frame_bytes(&model).ends_with("\r\n\u{1b}[J"));
+    }
+
+    #[test]
+    fn the_prompt_is_drawn_on_any_terminal_that_accepts_it() {
+        let safe = finding(Tier::Safe, "/cache", 1536, true);
+        let mut model = Model::new(
+            Vec::new(),
+            vec![safe],
+            Vec::new(),
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.handle(Key::Char('2'));
+        model.handle(Key::Char('t'));
+        model.handle(Key::Char('1'));
+        for rows in 1..12 {
+            model.set_rows(rows);
+            assert!(
+                render(&model).contains("confirm 1.5KiB  1"),
+                "{rows} rows:\n{}",
+                render(&model)
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_staged_while_the_total_is_typed_cancels_the_prompt() {
+        let big = finding(Tier::Safe, "/cache", 1536 * 1024 * 1024, true);
+        let mut model = Model::new(
+            Vec::new(),
+            vec![big],
+            Vec::new(),
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.handle(Key::Char('2'));
+        model.handle(Key::Char('t'));
+        for key in decode(b"1.5GiB") {
+            model.handle(key);
+        }
+        // A held row changes nothing that Enter would move.
+        model.push_finding(held(Tier::Caution, "/proj/target", Skip::Dirty));
+        assert!(render(&model).contains("confirm 1.5GiB  1.5GiB"));
+
+        // 50 MiB more is still "1.5GiB" to one decimal place.
+        model.push_finding(finding(Tier::Safe, "/more", 50 * 1024 * 1024, true));
+        assert_eq!(format_bytes(model.staged_bytes()), "1.5GiB");
+        assert!(render(&model).contains("the staged rows changed"));
+        assert_eq!(model.handle(Key::Enter), Effect::None);
+    }
+
+    #[test]
+    fn a_finished_walk_does_not_take_the_screen_from_a_prompt() {
+        let safe = finding(Tier::Safe, "/cache", 1536, true);
+        let mut model = Model::new(
+            vec![volume("/Data", true)],
+            vec![safe],
+            Vec::new(),
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.handle(Key::Char('u'));
+        model.begin_walk(PathBuf::from("/Data"));
+        model.handle(Key::Char('2'));
+        model.handle(Key::Char('t'));
+        model.set_usage(UsageNode {
+            path: PathBuf::from("/Data"),
+            apparent_bytes: 1,
+            children: Vec::new(),
+        });
+        let frame = render(&model);
+        assert!(frame.contains("disk-health  reclaim"), "{frame}");
+        assert!(frame.contains("confirm 1.5KiB"), "{frame}");
+        assert!(frame.contains("press 3 to see it"), "{frame}");
+    }
+
+    #[test]
+    fn a_walk_is_not_forgotten_when_an_apply_starts() {
+        let mut model = volume_model(10, Palette::Plain);
+        model.begin_walk(PathBuf::from("/Data"));
+        model.begin_apply();
+        model.finish_apply(&ApplyReport {
+            moved: Vec::new(),
+            skipped: Vec::new(),
+        });
+        // Still walking, so a second walk does not start.
+        assert_eq!(model.handle(Key::Char('u')), Effect::None);
+        assert!(render(&model).contains("still walking /Data"));
+    }
+
+    #[test]
+    fn an_escape_sequence_split_across_two_reads_is_one_key() {
+        let mut pending = Pending::default();
+        assert_eq!(pending.take(Some(b"j\x1b")), [Key::Char('j')]);
+        assert_eq!(pending.take(Some(b"[")), []);
+        assert_eq!(pending.take(Some(b"B\x1b[5")), [Key::Down]);
+        assert_eq!(pending.take(Some(b"~q")), [Key::PageUp, Key::Char('q')]);
+
+        // Nothing follows a real Escape. The timed-out read delivers it.
+        assert_eq!(pending.take(Some(b"\x1b")), []);
+        assert_eq!(pending.take(None), [Key::Escape]);
+        assert_eq!(pending.take(None), []);
+
+        // An ESC inside what looked like a sequence starts a new one.
+        assert_eq!(decode(b"\x1b[\x1b[B"), [Key::Down]);
+    }
+
+    #[test]
+    fn going_up_sorts_the_parent_and_keeps_the_directory_selected() {
+        let leaf = |path: &str, bytes| UsageNode {
+            path: PathBuf::from(path),
+            apparent_bytes: bytes,
+            children: Vec::new(),
+        };
+        let mut model = Model::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Palette::Plain,
+            UNIX_EPOCH,
+        );
+        model.set_usage(UsageNode {
+            path: PathBuf::from("/vol"),
+            apparent_bytes: 100,
+            children: vec![
+                UsageNode {
+                    children: vec![leaf("/vol/zebra/file", 70)],
+                    ..leaf("/vol/zebra", 70)
+                },
+                leaf("/vol/apple", 30),
+            ],
+        });
+        model.handle(Key::Enter);
+        model.handle(Key::Char('s'));
+        model.handle(Key::Backspace);
+
+        let frame = render(&model);
+        assert!(frame.contains("sort (name)"), "{frame}");
+        assert!(frame.find("apple") < frame.find("zebra"), "{frame}");
+        // The cursor is on the directory that was left, now second.
+        assert!(frame.contains("▸ zebra"), "{frame}");
     }
 
     #[test]

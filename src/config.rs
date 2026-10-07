@@ -137,7 +137,7 @@ pub fn load(home: &Path) -> Result<Loaded> {
         None => Vec::new(),
         Some(lines) => lines
             .iter()
-            .map(|line| expand(home, line).map(|path| settle(&path)))
+            .map(|line| expand(home, line).and_then(|path| settle(&path)))
             .collect::<Result<Vec<_>>>()?,
     };
 
@@ -197,9 +197,10 @@ pub fn deny_prefixes(home: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     prefixes
 }
 
-/// The home directory with symlinks resolved, so it compares equal to the
-/// canonical paths the scan produces. A home that does not exist is returned
-/// as given.
+/// Returns the home directory with symlinks resolved.
+///
+/// It then compares equal to the canonical paths the scan produces. A home
+/// that does not exist is returned as given.
 ///
 /// # Errors
 ///
@@ -297,7 +298,8 @@ fn is_under(path: &Path, prefix: &Path) -> bool {
     })
 }
 
-/// Whether a case-insensitive volume would treat the two names as one.
+/// Compares two names after lowercasing them. Unicode is not normalized, so
+/// a precomposed and a decomposed spelling of one name still differ.
 fn same_name(left: &OsStr, right: &OsStr) -> bool {
     if left == right {
         return true;
@@ -483,8 +485,16 @@ fn expand(home: &Path, line: &str) -> Result<PathBuf> {
 
 /// Resolves an exclude line when it exists, so a line that names a symlink or
 /// uses a different case still matches the canonical paths the walk produces.
-fn settle(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize(path))
+///
+/// A line for a path that does not exist yet is kept as written. Any other
+/// failure is an error: an exclude that silently stops matching is a tree
+/// the operator asked to leave alone and the scan walks anyway.
+fn settle(path: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(canonical) => Ok(canonical),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(normalize(path)),
+        Err(err) => Err(Error::io("resolve exclude", path, err)),
+    }
 }
 
 fn read_lines(path: &Path) -> Result<Option<Vec<String>>> {

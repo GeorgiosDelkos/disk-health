@@ -1,7 +1,12 @@
 //! Move a staged plan entry onto the same volume, or leave it alone.
 //!
 //! Only the volume the home directory is on is touched. An entry on any
-//! other device is skipped, so the trash is always `~/.Trash`.
+//! other device is skipped, so the trash is `~/.Trash`, or a quarantine
+//! directory on that volume when `~/.Trash` cannot be used.
+//!
+//! `restore` and `purge` act on a log line only when the object at its
+//! destination is still the inode the line recorded. Trash names repeat
+//! across plans, and an emptied trash frees them.
 //!
 //! The only mutation is `rename`. A cross-device error is a skip: nothing is
 //! copied and nothing is unlinked. `purge` is the only unlink, and it only
@@ -78,8 +83,11 @@ impl Renamer for FsRename {
 }
 
 /// `ENOTSUP` from the macOS SDK header `sys/errno.h`.
+const ENOTSUP: i32 = 45;
+
+/// Reports whether the filesystem has no exclusive rename.
 fn exclusive_unsupported(source: &std::io::Error) -> bool {
-    source.kind() == ErrorKind::Unsupported || source.raw_os_error() == Some(45)
+    source.kind() == ErrorKind::Unsupported || source.raw_os_error() == Some(ENOTSUP)
 }
 
 /// For a filesystem without `RENAME_EXCL`. The check and the rename are two
@@ -407,7 +415,7 @@ fn revalidate(request: &ApplyRequest<'_>, entry: &Entry) -> Option<SkipMove> {
     if meta.dev != request.home_dev {
         return Some(SkipMove::OtherVolume);
     }
-    let locks = match admitted(request, entry) {
+    let locks = match admitted(request, entry, meta.kind) {
         Ok(locks) => locks,
         Err(reason) => return Some(reason),
     };
@@ -446,11 +454,12 @@ fn wrong_object(entry: &Entry, meta: &EntryMeta) -> Option<SkipMove> {
 /// The tool lock files to probe, once the path is canonical and a rule names it.
 ///
 /// The denylist was compared against the path as written. That only means
-/// something when the path is the canonical one, so `~/link/keys` and
-/// `~/.SSH` stop here.
+/// something when the path is the canonical one, so `~/link/cache` and
+/// `~/CACHE` stop here.
 fn admitted(
     request: &ApplyRequest<'_>,
     entry: &Entry,
+    kind: Kind,
 ) -> std::result::Result<Vec<PathBuf>, SkipMove> {
     match request.fs.canonical(&entry.path) {
         Ok(canonical) if canonical == entry.path => {}
@@ -467,6 +476,7 @@ fn admitted(
         rule: &entry.rule,
         tier: entry.tier,
         path: &entry.path,
+        kind,
         marker: entry.marker.as_deref(),
     };
     admit(request.fs, &rules, &claim).ok_or(SkipMove::Rule)
@@ -681,8 +691,9 @@ impl std::fmt::Debug for RestoreRequest<'_> {
 ///
 /// # Errors
 ///
-/// Returns an error when the id is unknown, the destination is outside trash,
-/// the original path exists, or the rename fails. An existing original is
+/// Returns an error when the id is unknown, the destination is outside trash
+/// or no longer holds the object that was moved, the original path exists,
+/// or the rename fails. An existing original is
 /// left untouched.
 ///
 /// # Examples
@@ -715,6 +726,11 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<PathBuf> {
     if trusted_root(&action.to, request.home, request.uid).is_none() {
         return Err(Error::Plan {
             message: "action destination is outside trash".to_owned(),
+        });
+    }
+    if !same_object(action) {
+        return Err(Error::Plan {
+            message: "trash no longer holds what this action moved".to_owned(),
         });
     }
     match fs::symlink_metadata(&action.from) {
@@ -757,7 +773,8 @@ impl std::fmt::Debug for PurgeRequest<'_> {
 pub struct PurgeReport {
     /// Paths that were unlinked.
     pub removed: Vec<PathBuf>,
-    /// Rows that were too new, outside quarantine, or already gone.
+    /// Rows that were too new, outside quarantine, already gone, or followed
+    /// by a later move to the same destination.
     pub ignored: u64,
 }
 
@@ -765,7 +782,8 @@ pub struct PurgeReport {
 ///
 /// Platform trash is not touched. A row whose canonical path is outside the
 /// quarantine directory named in that row is ignored, and so is every row
-/// but the last for a destination.
+/// but the last for a destination, and a row whose destination now holds a
+/// different inode.
 ///
 /// # Errors
 ///
@@ -808,7 +826,7 @@ pub fn purge(request: &PurgeRequest<'_>) -> Result<PurgeReport> {
             ignored += 1;
             continue;
         };
-        if !still_inside(&action.to, &root) {
+        if !still_inside(&action.to, &root) || !same_object(action) {
             ignored += 1;
             continue;
         }
@@ -816,6 +834,18 @@ pub fn purge(request: &PurgeRequest<'_>) -> Result<PurgeReport> {
         removed.push(action.to.clone());
     }
     Ok(PurgeReport { removed, ignored })
+}
+
+/// Whether the destination still holds the inode the action moved there.
+///
+/// A rename within a volume keeps the inode. A different one at the same
+/// name is some other tree: the trash was emptied and a later plan reused
+/// `0-target`, or the move was never logged and an older line names its place.
+fn same_object(action: &crate::log::Action) -> bool {
+    use std::os::darwin::fs::MetadataExt;
+
+    fs::symlink_metadata(&action.to)
+        .is_ok_and(|meta| meta.st_dev() == action.dev && meta.st_ino() == action.ino)
 }
 
 fn old_enough(at: SystemTime, now: SystemTime) -> bool {
@@ -910,7 +940,7 @@ mod sys {
     const RENAME_EXCL: c_uint = 0x0000_0004;
 
     unsafe extern "C" {
-        /// `int renamex_np(const char *, const char *, unsigned int)` from `stdio.h`.
+        /// `int renamex_np(const char *, const char *, unsigned int)` from `sys/stdio.h`.
         fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
     }
 
@@ -938,5 +968,29 @@ mod sys {
             io::ErrorKind::Unsupported,
             "disk-health runs on macOS",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_without_the_exclusive_call_still_refuses_an_existing_destination() {
+        let dir = std::env::temp_dir().join(format!("disk-health-fallback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (from, kept, free) = (dir.join("from"), dir.join("kept"), dir.join("free"));
+        fs::write(&from, b"new").unwrap();
+        fs::write(&kept, b"kept").unwrap();
+
+        let err = rename_after_check(&from, &kept).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&kept).unwrap(), b"kept");
+
+        rename_after_check(&from, &free).unwrap();
+        assert_eq!(fs::read(&free).unwrap(), b"new");
+        assert!(!from.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

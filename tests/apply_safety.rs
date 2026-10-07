@@ -239,13 +239,13 @@ fn exdev_leaves_the_source_bytes_in_place() {
     let fixture = TempDir::new("exdev");
     let home = fixture.path().join("home");
     let cache = home.join("cache");
-    fs::create_dir_all(&home).unwrap();
-    fs::write(&cache, b"keep-me").unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("blob"), b"keep-me").unwrap();
     let plan = Plan::from_entries(vec![entry_at(&cache, true, None)], "host", now());
     let mut log = MemoryLog::default();
     let report = apply_real(&plan, &plan.plan_id, &home, &Exdev, &mut log).unwrap();
 
-    assert_eq!(fs::read(&cache).unwrap(), b"keep-me");
+    assert_eq!(fs::read(cache.join("blob")).unwrap(), b"keep-me");
     assert!(
         matches!(report.skipped[0].reason, SkipMove::Exdev),
         "{:?}",
@@ -260,8 +260,8 @@ fn rename_keeps_the_inode_and_restore_puts_it_back() {
     let fixture = TempDir::new("rename");
     let home = fixture.path().join("home");
     let cache = home.join("cache");
-    fs::create_dir_all(&home).unwrap();
-    fs::write(&cache, b"bytes").unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("blob"), b"bytes").unwrap();
     let entry = entry_at(&cache, true, None);
     let inode = entry.ino;
     let plan = Plan::from_entries(vec![entry], "host", now());
@@ -273,7 +273,7 @@ fn rename_keeps_the_inode_and_restore_puts_it_back() {
     let moved = &report.moved[0];
     assert!(moved.to.starts_with(home.join(".Trash")));
     assert_eq!(RealFs.meta(&moved.to).unwrap().ino, inode);
-    assert_eq!(fs::read(&moved.to).unwrap(), b"bytes");
+    assert_eq!(fs::read(moved.to.join("blob")).unwrap(), b"bytes");
     assert!(moved.logged);
 
     let restored = restore(&RestoreRequest {
@@ -285,7 +285,7 @@ fn rename_keeps_the_inode_and_restore_puts_it_back() {
     })
     .unwrap();
     assert_eq!(restored, cache);
-    assert_eq!(fs::read(&cache).unwrap(), b"bytes");
+    assert_eq!(fs::read(cache.join("blob")).unwrap(), b"bytes");
 }
 
 #[test]
@@ -298,15 +298,8 @@ fn restore_does_not_clobber_an_existing_path() {
     fs::write(&cache, b"original").unwrap();
     fs::write(&trashed, b"trashed").unwrap();
     let action = Action {
-        id: String::new(),
-        plan_id: "plan".to_owned(),
-        rule: "fixture".to_owned(),
         from: cache.clone(),
-        to: trashed.clone(),
-        dev: 1,
-        ino: 2,
-        apparent_bytes: 8,
-        at: now(),
+        ..logged(&trashed, now())
     }
     .stamp();
     let mut log = MemoryLog::default();
@@ -576,6 +569,57 @@ fn target_of_a_symlink_at_the_rule_path_is_not_moved() {
     );
 }
 
+/// The builtin rule for `~/.claude/shell-snapshots`: loose files, and the
+/// directory stays.
+fn aged_files_rule() -> Vec<SafeRule> {
+    rules::builtin_safe()
+        .into_iter()
+        .filter(|rule| rule.id == "claude-shell-snapshots")
+        .collect()
+}
+
+#[test]
+fn files_rule_moves_a_loose_file_and_not_the_directory_or_a_subdirectory() {
+    let fixture = TempDir::new("files");
+    let home = fixture.path().join("home");
+    let snapshots = home.join(".claude/shell-snapshots");
+    let state = snapshots.join("state");
+    let loose = snapshots.join("snapshot.sh");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(&loose, b"old").unwrap();
+    let home_dev = RealFs.meta(&home).unwrap().dev;
+
+    for (path, moved) in [(&snapshots, false), (&state, false), (&loose, true)] {
+        let entry = Entry {
+            rule: "claude-shell-snapshots".to_owned(),
+            ..entry_at(path, true, None)
+        };
+        let plan = Plan::from_entries(vec![entry], "host", now());
+        let renamer = Recorded(Mutex::new(Vec::new()));
+        let mut log = MemoryLog::default();
+        let report = apply(ApplyRequest {
+            plan: &plan,
+            confirm: &plan.plan_id,
+            home: &home,
+            home_dev,
+            deny: &deny_prefixes(&home, &[]),
+            safe_rules: &aged_files_rule(),
+            project_rules: &[],
+            fs: &RealFs,
+            renamer: &renamer,
+            log: &mut log,
+            now: now(),
+            interrupt: None,
+        })
+        .unwrap();
+
+        assert_eq!(renamer.calls(), usize::from(moved), "{}", path.display());
+        if !moved {
+            assert!(matches!(report.skipped[0].reason, SkipMove::Rule));
+        }
+    }
+}
+
 #[test]
 fn path_through_a_symlink_or_in_another_case_is_not_moved() {
     let fixture = TempDir::new("spelling");
@@ -702,6 +746,76 @@ fn a_running_cargo_build_holds_the_target() {
 }
 
 #[test]
+fn restore_and_purge_leave_a_reused_trash_name_alone() {
+    let fixture = TempDir::new("reused");
+    let home = fixture.path().join("home");
+    let quarantine = fixture.path().join("vol/.disk-health-quarantine/plan");
+    fs::create_dir_all(home.join(".Trash")).unwrap();
+    fs::create_dir_all(&quarantine).unwrap();
+
+    // Each line was written for some other tree. The trash was emptied and
+    // a later plan put a different one at the same name.
+    let mut log = MemoryLog::default();
+    let mut ids = Vec::new();
+    for name in [home.join(".Trash/0-target"), quarantine.join("0-target")] {
+        fs::write(&name, b"first").unwrap();
+        let action = Action {
+            from: home.join("a/target"),
+            ..logged(&name, now() - Duration::from_hours(8 * 24))
+        }
+        .stamp();
+        fs::remove_file(&name).unwrap();
+        fs::create_dir(&name).unwrap();
+        fs::write(name.join("b-build"), b"second").unwrap();
+        log.append(&action).unwrap();
+        ids.push(action.id);
+    }
+
+    let err = restore(&RestoreRequest {
+        id: &ids[0],
+        home: &home,
+        uid: 501,
+        log: &log,
+        renamer: &FsRename,
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("no longer holds"), "{err}");
+    assert!(!home.join("a/target").exists());
+
+    let report = purge(&PurgeRequest {
+        log: &log,
+        now: now(),
+    })
+    .unwrap();
+    assert_eq!(report.removed, Vec::<PathBuf>::new());
+    assert!(quarantine.join("0-target/b-build").exists());
+}
+
+#[test]
+fn install_inside_a_pruned_directory_is_not_a_project() {
+    let fixture = TempDir::new("nested");
+    let home = fixture.path().join("home");
+    let inner = fixture.path().join("app/node_modules/pkg");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(inner.join("node_modules")).unwrap();
+    fs::write(inner.join("package.json"), b"{}").unwrap();
+    fs::write(inner.join("yarn.lock"), b"").unwrap();
+
+    let entry = Entry {
+        rule: "node-modules".to_owned(),
+        tier: Tier::Caution,
+        ..entry_at(
+            &inner.join("node_modules"),
+            true,
+            Some(inner.join("yarn.lock")),
+        )
+    };
+    let (calls, report) = apply_one(entry, &home);
+    assert_eq!(calls, 0);
+    assert!(matches!(report.skipped[0].reason, SkipMove::Rule));
+}
+
+#[test]
 fn purge_keeps_a_path_that_was_quarantined_again() {
     let fixture = TempDir::new("requarantine");
     let quarantine = fixture
@@ -729,15 +843,17 @@ fn purge_keeps_a_path_that_was_quarantined_again() {
     assert_eq!(fs::read(&again).unwrap(), b"moved a minute ago");
 }
 
+/// A log line for a move that put the object now at `path` there.
 fn logged(path: &Path, at: SystemTime) -> Action {
+    let meta = RealFs.meta(path).expect("the logged destination exists");
     Action {
         id: String::new(),
         plan_id: "plan".to_owned(),
         rule: "fixture".to_owned(),
         from: PathBuf::from("/cache"),
         to: path.to_path_buf(),
-        dev: 1,
-        ino: 2,
+        dev: meta.dev,
+        ino: meta.ino,
         apparent_bytes: 4,
         at,
     }

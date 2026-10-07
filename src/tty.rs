@@ -1,4 +1,4 @@
-//! Raw mode, window size, and the two signals the UI watches.
+//! Raw mode, window size, and the signals the UI watches.
 //!
 //! Unsafe is confined to the private `sys` module. The handlers store into an [`AtomicBool`]
 //! and return. They do not allocate, lock, or run destructors, so they stay
@@ -37,7 +37,9 @@ const TCSAFLUSH: i32 = 2;
 
 /// `signal.h`. Not set on the action we install.
 const SA_RESTART: u32 = 2;
+const SIGHUP: i32 = 1;
 const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
 const SIGWINCH: i32 = 28;
 
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?2004l";
@@ -51,7 +53,7 @@ static PRIOR_HOOK: Mutex<Option<PanicHook>> = Mutex::new(None);
 
 /// The flag [`crate::trash::apply`] polls between entries.
 ///
-/// The `SIGINT` handler stores `true` with [`Ordering::Release`].
+/// The handler for the stop signals stores `true` with [`Ordering::Release`].
 ///
 /// # Examples
 ///
@@ -65,7 +67,8 @@ pub fn interrupt_flag() -> &'static AtomicBool {
     &INTERRUPTED
 }
 
-/// Reports whether `SIGINT` has been delivered since the process started.
+/// Reports whether `SIGINT`, `SIGTERM`, or `SIGHUP` has been delivered since
+/// the process started.
 ///
 /// # Examples
 ///
@@ -249,19 +252,25 @@ impl Drop for PanicGuard {
     }
 }
 
-/// Restores the previous `SIGINT` action, and `SIGWINCH` when it was installed.
+/// Restores the signal actions it replaced.
 #[derive(Debug)]
 pub struct Signals {
-    previous_int: [u8; sys::ACTION_LEN],
-    previous_winch: Option<[u8; sys::ACTION_LEN]>,
+    /// Signal number and the action that was installed before ours, in the
+    /// order they were replaced.
+    previous: Vec<(i32, [u8; sys::ACTION_LEN])>,
 }
 
 impl Signals {
-    /// Handles `SIGINT` by setting [`interrupt_flag`].
+    /// Handles `SIGINT`, `SIGTERM`, and `SIGHUP` by setting [`interrupt_flag`].
+    ///
+    /// All three mean "stop". An apply polls the flag between entries, so a
+    /// closed terminal window or a `kill` ends it after a rename is logged
+    /// and not between the rename and its log line.
     ///
     /// # Errors
     ///
-    /// Returns an error when `sigaction` fails.
+    /// Returns an error when `sigaction` fails. Actions already replaced are
+    /// put back first.
     ///
     /// # Examples
     ///
@@ -271,37 +280,40 @@ impl Signals {
     /// let _install = Signals::install_interrupt;
     /// ```
     pub fn install_interrupt() -> io::Result<Self> {
-        let previous_int = sys::install_signal(SIGINT, on_sigint)?;
-        Ok(Self {
-            previous_int,
-            previous_winch: None,
-        })
+        let mut signals = Self {
+            previous: Vec::new(),
+        };
+        for signal in [SIGINT, SIGTERM, SIGHUP] {
+            signals.replace(signal, on_sigint)?;
+        }
+        Ok(signals)
     }
 
-    /// Handles `SIGINT` and `SIGWINCH`.
+    /// Handles the three stop signals and `SIGWINCH`.
     ///
     /// # Errors
     ///
-    /// Returns an error when `sigaction` fails. A failure on `SIGWINCH`
-    /// restores the `SIGINT` action before returning.
+    /// Returns an error when `sigaction` fails. Actions already replaced are
+    /// put back first.
     pub fn install_with_resize() -> io::Result<Self> {
         let mut signals = Self::install_interrupt()?;
-        match sys::install_signal(SIGWINCH, on_winch) {
-            Ok(previous) => signals.previous_winch = Some(previous),
-            Err(err) => {
-                let _ = sys::restore_signal(SIGINT, &signals.previous_int);
-                return Err(err);
-            }
-        }
+        signals.replace(SIGWINCH, on_winch)?;
         Ok(signals)
+    }
+
+    /// On failure `self` is dropped by the caller's `?`, which restores
+    /// what was replaced so far.
+    fn replace(&mut self, signal: i32, handler: extern "C" fn(i32)) -> io::Result<()> {
+        let previous = sys::install_signal(signal, handler)?;
+        self.previous.push((signal, previous));
+        Ok(())
     }
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        let _ = sys::restore_signal(SIGINT, &self.previous_int);
-        if let Some(previous) = &self.previous_winch {
-            let _ = sys::restore_signal(SIGWINCH, previous);
+        for (signal, previous) in self.previous.iter().rev() {
+            let _ = sys::restore_signal(*signal, previous);
         }
     }
 }
@@ -325,7 +337,8 @@ pub fn write_frame(fd: i32, frame: &str) -> io::Result<()> {
 /// Returns an error when `read` fails for a reason other than interruption.
 pub fn read_input(fd: i32) -> io::Result<Option<Vec<u8>>> {
     // A held key repeats faster than the UI reads, and a pasted total is
-    // several bytes. Both have to arrive whole.
+    // several bytes. Room for both in one read. A longer burst is split,
+    // and the next read picks up the rest.
     let mut buf = [0u8; 64];
     let read = sys::read_fd(fd, &mut buf)?;
     if read == 0 {

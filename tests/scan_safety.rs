@@ -612,6 +612,45 @@ fn another_disk_is_not_scanned() {
     assert_eq!(report.dirs_visited, 0);
 }
 
+#[test]
+fn young_tree_in_a_dirty_repository_is_held_as_dirty() {
+    let fs = MemFs::new();
+    fs.dir("/h", 1, old());
+    fs.dir("/h/crate", 1, old());
+    fs.file("/h/crate/Cargo.toml", 1, 2, old());
+    // Two days old: younger than the seven days the rule asks for.
+    let recent = now() - Duration::from_hours(48);
+    fs.dir("/h/crate/target", 1, recent);
+    fs.file("/h/crate/target/CACHEDIR.TAG", 1, 43, recent);
+
+    let mut git = MapGit::default();
+    git.by_path
+        .insert(PathBuf::from("/h/crate"), GitTree::Dirty);
+    let dirty = scan_projects(&fs, &git);
+    // Age is the one hold the UI lets an operator override. A dirty tree
+    // must not be reported as merely young.
+    assert_eq!(dirty.findings[0].skip, Some(Skip::Dirty));
+
+    let clean = scan_projects(&fs, &MapGit::default());
+    assert_eq!(clean.findings[0].skip, Some(Skip::Young));
+}
+
+#[test]
+fn candidate_that_is_a_mount_point_is_not_measured() {
+    let fs = MemFs::new();
+    fs.dir("/h", 1, old());
+    fs.dir("/h/crate", 1, old());
+    fs.file("/h/crate/Cargo.toml", 1, 2, old());
+    // The parent's listing shows a plain `target`. Another disk is mounted on it.
+    fs.dir("/h/crate/target", 1, old());
+    fs.file("/h/crate/target/CACHEDIR.TAG", 2, 43, old());
+    fs.file("/h/crate/target/huge.img", 2, 9_000_000, old());
+    fs.mount(Path::new("/h/crate/target"), 2);
+
+    let report = scan_projects(&fs, &MapGit::default());
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+}
+
 /// Counts how often the scan asks about a project.
 #[derive(Default)]
 struct CountingGit(std::sync::atomic::AtomicUsize);
@@ -644,9 +683,7 @@ fn git_is_asked_once_per_project_not_once_per_rule() {
             .iter()
             .all(disk_health::scan::Finding::staged)
     );
-    // Two workers can race to the first answer, so the bound is not exactly 1.
-    let asked = git.0.load(std::sync::atomic::Ordering::Relaxed);
-    assert!((1..3).contains(&asked), "git status ran {asked} times");
+    assert_eq!(git.0.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[test]

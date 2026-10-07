@@ -5,8 +5,8 @@
 //! reporting a `node_modules` link and sizing the directory it points at.
 //!
 //! A directory is listed with `getattrlistbulk`, which returns each child's
-//! attributes in the same call. One `lstat` per file was 98% of the wall time
-//! of a scan. Two things keep the bulk listing as strict as `lstat` was:
+//! attributes in the same call, where one `lstat` per file was nearly all of
+//! a scan's wall time. Two things keep the bulk listing as strict as `lstat` was:
 //!
 //! - The directory is opened with `O_NOFOLLOW`, so a symlink swapped in after
 //!   the parent was listed is an error and not a walk of its target.
@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,11 @@ pub const SF_DATALESS: u32 = 0x4000_0000;
 const O_NOFOLLOW: i32 = 0x0100;
 /// `O_DIRECTORY` from the macOS SDK header `sys/fcntl.h`.
 const O_DIRECTORY: i32 = 0x0010_0000;
+/// `O_NONBLOCK` from the macOS SDK header `sys/fcntl.h`.
+const O_NONBLOCK: i32 = 0x0004;
+/// `ENOTSUP` and `EOPNOTSUPP` from the macOS SDK header `sys/errno.h`.
+const ENOTSUP: i32 = 45;
+const EOPNOTSUPP: i32 = 102;
 
 /// What `lstat` reported. Sockets and devices are [`Kind::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,20 +248,30 @@ impl Fs for RealFs {
             .custom_flags(O_DIRECTORY | O_NOFOLLOW)
             .open(path)
             .map_err(failed)?;
-        let dev = dir.metadata().map_err(failed)?.st_dev();
+        let opened = dir.metadata().map_err(failed)?;
 
         let entries = match sys::list_bulk(&dir) {
             Ok(entries) => entries,
             // Not every filesystem implements the bulk call. `lstat` works on all of them.
-            Err(source) if bulk_unsupported(&source) => list_by_stat(path).map_err(failed)?,
+            Err(source) if bulk_unsupported(&source) => {
+                list_by_stat(path, &opened).map_err(failed)?
+            }
             Err(source) => return Err(failed(source)),
         };
-        Ok(Listing { dev, entries })
+        Ok(Listing {
+            dev: opened.st_dev(),
+            entries,
+        })
     }
 
     fn probe_lock(&self, path: &Path) -> Result<LockProbe> {
-        let file =
-            File::open(path).map_err(|source| Error::io("open for lock probe", path, source))?;
+        // A lock file sits inside a tree this tool does not own. A symlink
+        // there is not followed, and a FIFO there does not block the open.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .open(path)
+            .map_err(|source| Error::io("open for lock probe", path, source))?;
         match file.try_lock() {
             Ok(()) => {
                 // Drop releases the flock if unlock itself fails. Still report
@@ -298,13 +313,28 @@ fn entry_from(meta: &std::fs::Metadata) -> EntryMeta {
     }
 }
 
-/// `ENOTSUP` and `EOPNOTSUPP` from the macOS SDK header `sys/errno.h`.
+/// Reports whether the filesystem lacks the bulk call.
 fn bulk_unsupported(source: &std::io::Error) -> bool {
-    source.kind() == ErrorKind::Unsupported || matches!(source.raw_os_error(), Some(45 | 102))
+    source.kind() == ErrorKind::Unsupported
+        || matches!(source.raw_os_error(), Some(ENOTSUP | EOPNOTSUPP))
 }
 
 /// One `lstat` per name, for a filesystem without the bulk call.
-fn list_by_stat(path: &Path) -> std::io::Result<Vec<Listed>> {
+///
+/// `std::fs::read_dir` opens the path again, and that open follows a
+/// symlink. `opened` is the directory the caller holds without following
+/// one, so the path has to still be that same directory.
+fn list_by_stat(path: &Path, opened: &std::fs::Metadata) -> std::io::Result<Vec<Listed>> {
+    use std::os::darwin::fs::MetadataExt;
+
+    let named = std::fs::symlink_metadata(path)?;
+    if (named.st_dev(), named.st_ino()) != (opened.st_dev(), opened.st_ino()) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "directory was replaced while it was being listed",
+        ));
+    }
+
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
@@ -420,7 +450,7 @@ mod bulk {
             return None;
         }
 
-        let dev = u64::from(cursor.u32()?);
+        let dev = cursor.dev()?;
         let kind = match cursor.u32()? {
             VREG => Kind::File,
             VDIR => Kind::Directory,
@@ -492,6 +522,14 @@ mod bulk {
             self.take().map(u64::from_ne_bytes)
         }
 
+        /// A `dev_t`, widened the way `st_dev` is: it is an `int32_t`, and
+        /// std sign-extends it. Zero-extending would make a device with the
+        /// high bit set differ from what `lstat` reports for the same file.
+        fn dev(&mut self) -> Option<u64> {
+            let dev = i64::from(i32::from_ne_bytes(self.take()?));
+            Some(u64::from_ne_bytes(dev.to_ne_bytes()))
+        }
+
         fn i64(&mut self) -> Option<i64> {
             self.take().map(i64::from_ne_bytes)
         }
@@ -538,8 +576,9 @@ mod sys {
     const BUFFER_LEN: usize = 64 * 1024;
 
     unsafe extern "C" {
-        /// `int getattrlistbulk(int, struct attrlist *, void *, size_t, uint64_t)`
-        /// from `unistd.h`.
+        /// `int getattrlistbulk(int, void *, void *, size_t, uint64_t)` from
+        /// `sys/unistd.h`. The first pointer is a `struct attrlist *`
+        /// (`man 2 getattrlistbulk`).
         fn getattrlistbulk(
             dirfd: c_int,
             alist: *const AttrList,
@@ -819,6 +858,11 @@ pub fn measure_children(
     // Only the candidate's own listing is an error. A child that cannot be
     // listed is a partial measure: the candidate still exists, the size does not.
     let listing = fs.read_dir(root)?;
+    // `root_meta` can be stale or come from a listing. What was opened decides.
+    if listing.dev != root_meta.dev {
+        state.issues |= ISSUE_CROSSED;
+        return Ok((state.finish(), 0));
+    }
     for entry in listing.entries {
         let tallied = named.iter().any(|name| entry.name == *name);
         state.child(root, entry, tallied);
@@ -1133,8 +1177,8 @@ impl MemFs {
     /// Makes an existing directory a mount point for device `dev`.
     ///
     /// Its parent's listing keeps reporting the directory's own device, the
-    /// way a bulk listing describes what is under a mount. Only opening the
-    /// directory shows `dev`.
+    /// way a bulk listing describes what is under a mount. Opening the
+    /// directory, or [`Fs::meta`] on it, shows `dev`.
     ///
     /// # Panics
     ///
@@ -1270,11 +1314,12 @@ impl MemFs {
 impl Fs for MemFs {
     fn meta(&self, path: &Path) -> Result<EntryMeta> {
         let state = self.lock();
-        state
-            .nodes
-            .get(path)
-            .map(Node::meta)
-            .ok_or_else(|| missing(path))
+        let node = state.nodes.get(path).ok_or_else(|| missing(path))?;
+        // `lstat` of a mount point describes what is mounted there.
+        Ok(EntryMeta {
+            dev: node.mounted.unwrap_or(node.dev),
+            ..node.meta()
+        })
     }
 
     fn read_dir(&self, path: &Path) -> Result<Listing> {
@@ -1422,9 +1467,56 @@ mod tests {
     fn bulk_listing_agrees_with_lstat_on_system_directories() {
         // `/usr/bin` holds transparently compressed files, whose stored
         // length is not their size.
-        for dir in ["/usr/bin", "/private/etc", env!("CARGO_MANIFEST_DIR")] {
-            assert_listing_matches_lstat(Path::new(dir));
+        // None of these is written to while the tests run.
+        let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for dir in [Path::new("/usr/bin"), Path::new("/private/etc"), &sources] {
+            assert_listing_matches_lstat(dir);
         }
+    }
+
+    #[test]
+    fn stat_fallback_agrees_with_lstat_and_refuses_a_swapped_directory() {
+        use std::os::darwin::fs::MetadataExt;
+
+        let scratch = Scratch::new("fallback");
+        let dir = scratch.0.join("dir");
+        let other = scratch.0.join("other");
+        fs::create_dir(&dir).unwrap();
+        fs::create_dir(&other).unwrap();
+        fs::write(dir.join("blob"), b"12345").unwrap();
+        symlink("/nowhere", dir.join("dangling")).unwrap();
+
+        let opened = fs::metadata(&dir).unwrap();
+        let mut listed = list_by_stat(&dir, &opened).unwrap();
+        listed.sort_by(|left, right| left.name.cmp(&right.name));
+        let blob = listed[0].meta.unwrap();
+        assert_eq!(listed[0].name, "blob");
+        assert_eq!(blob, RealFs.meta(&dir.join("blob")).unwrap());
+        assert_eq!(listed[1].meta.unwrap().kind, Kind::Symlink);
+
+        // The path now names a different directory than the one held open.
+        let elsewhere = fs::metadata(&other).unwrap();
+        assert_ne!(elsewhere.st_ino(), opened.st_ino());
+        assert!(list_by_stat(&dir, &elsewhere).is_err());
+    }
+
+    #[test]
+    fn lock_probe_does_not_follow_a_symlink_or_wait_on_a_fifo() {
+        let scratch = Scratch::new("probe");
+        let real = scratch.0.join("real-lock");
+        fs::write(&real, b"").unwrap();
+        symlink(&real, scratch.0.join("link-lock")).unwrap();
+        assert_eq!(RealFs.probe_lock(&real).unwrap(), LockProbe::Free);
+        assert!(RealFs.probe_lock(&scratch.0.join("link-lock")).is_err());
+
+        let fifo = scratch.0.join("fifo-lock");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // A blocking open of a FIFO with no writer never returns.
+        let _ = RealFs.probe_lock(&fifo);
     }
 
     #[test]
@@ -1455,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn hardlinked_file_is_counted_once_and_single_links_are_not_tracked() {
+    fn hardlinked_file_is_counted_once() {
         let fs = MemFs::new();
         let when = SystemTime::UNIX_EPOCH;
         fs.dir("/cache", 1, when);

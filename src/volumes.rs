@@ -145,7 +145,7 @@ pub fn describe(raw: &MountRaw) -> Volume {
         total_bytes,
         used_bytes,
         available_bytes,
-        dev: u64::from(raw.fsid),
+        dev: widen_dev(raw.fsid),
         walkable,
         note,
     }
@@ -336,6 +336,14 @@ fn refused_mount(mount: &str) -> Option<&'static str> {
     None
 }
 
+/// `f_fsid.val[0]` as `st_dev` reports it. Both are `int32_t`, and std
+/// sign-extends `st_dev` to 64 bits, so the same has to happen here or a
+/// device with the high bit set would never match.
+fn widen_dev(fsid: u32) -> u64 {
+    let signed = i64::from(i32::from_ne_bytes(fsid.to_ne_bytes()));
+    u64::from_ne_bytes(signed.to_ne_bytes())
+}
+
 fn read_u32(buf: &[u8], offset: usize) -> u32 {
     let bytes = [
         buf[offset],
@@ -463,6 +471,12 @@ mod tests {
         let found = home_volume(home_dev, &mounts).expect("the home volume is walkable");
         assert_eq!(std::fs::metadata(&found.mount).unwrap().st_dev(), home_dev);
         assert_ne!(found.mount, std::path::Path::new("/"));
+    }
+
+    #[test]
+    fn device_is_widened_like_st_dev() {
+        assert_eq!(widen_dev(16_777_234), 16_777_234);
+        assert_eq!(widen_dev(0x8000_0001), 0xFFFF_FFFF_8000_0001);
     }
 
     #[test]

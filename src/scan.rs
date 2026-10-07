@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -221,10 +221,10 @@ impl std::fmt::Debug for ScanOptions<'_> {
 /// assert!(report.findings.is_empty());
 /// ```
 pub fn scan(opts: &ScanOptions<'_>) -> Result<Report> {
-    let git = GitCache::new(opts.git);
     // A home that cannot be stated has no volume, so nothing is on it.
     let home_dev = opts.fs.meta(opts.home).ok().map(|meta| meta.dev);
-    let mut chunk = run_workers(opts, &git, home_dev)?;
+    let shared = Shared::new(opts.git, home_dev);
+    let mut chunk = run_workers(opts, &shared)?;
 
     chunk.findings.sort_by(|left, right| {
         left.tier
@@ -254,10 +254,10 @@ const MAX_MEASURERS: usize = 8;
 
 /// Runs the three kinds of work side by side.
 ///
-/// Each safe rule has a thread, as before. The calling thread walks the
+/// Each safe rule has a thread. The calling thread walks the
 /// project roots, which is cheap, and hands every candidate it finds to a
 /// pool that does the expensive part: measuring the tree and asking `git`.
-fn run_workers(opts: &ScanOptions<'_>, git: &GitCache<'_>, home_dev: Option<u64>) -> Result<Chunk> {
+fn run_workers(opts: &ScanOptions<'_>, shared: &Shared<'_>) -> Result<Chunk> {
     let (tx, rx) = mpsc::channel();
     let rx = Mutex::new(rx);
 
@@ -270,18 +270,21 @@ fn run_workers(opts: &ScanOptions<'_>, git: &GitCache<'_>, home_dev: Option<u64>
 
         let measurers = thread::available_parallelism().map_or(1, NonZero::get);
         for _ in 0..measurers.min(MAX_MEASURERS) {
-            handles.push(spawn(scope, opts, || measure_queue(opts, git, &rx))?);
+            handles.push(spawn(scope, opts, || measure_queue(opts, shared, &rx))?);
         }
         for rule in opts.safe_rules {
-            handles.push(spawn(scope, opts, move || {
-                eval_safe(opts, git, rule, home_dev)
-            })?);
+            handles.push(spawn(scope, opts, move || eval_safe(opts, shared, rule))?);
         }
 
-        let mut merged = discover_projects(opts, &tx, home_dev);
+        let mut merged = discover_projects(opts, &tx, shared.home_dev);
         drop(tx);
         for handle in handles {
-            merged.merge(handle.join().expect("scan worker panicked"));
+            // A worker's panic is this scan's panic. It is not swallowed here.
+            merged.merge(
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
         }
         Ok(merged)
     })
@@ -299,7 +302,7 @@ fn spawn<'scope>(
 
 fn measure_queue(
     opts: &ScanOptions<'_>,
-    git: &GitCache<'_>,
+    shared: &Shared<'_>,
     queue: &Mutex<mpsc::Receiver<Candidate>>,
 ) -> Chunk {
     let mut chunk = Chunk::default();
@@ -313,36 +316,37 @@ fn measure_queue(
         let Ok(candidate) = next else {
             return chunk;
         };
-        consider(&mut chunk, opts, git, &candidate);
+        consider(&mut chunk, opts, shared, &candidate);
     }
 }
 
-/// One `git status` per project directory, however many rules match there.
-struct GitCache<'a> {
+/// What every scan thread reads: the home volume, and one `git status`
+/// per project directory however many rules match there.
+struct Shared<'a> {
+    /// Device of the home directory. Nothing on another device is a candidate.
+    home_dev: Option<u64>,
     probe: &'a dyn GitProbe,
-    seen: Mutex<HashMap<PathBuf, GitTree>>,
+    seen: Mutex<HashMap<PathBuf, Arc<OnceLock<GitTree>>>>,
 }
 
-impl<'a> GitCache<'a> {
-    fn new(probe: &'a dyn GitProbe) -> Self {
+impl<'a> Shared<'a> {
+    fn new(probe: &'a dyn GitProbe, home_dev: Option<u64>) -> Self {
         Self {
+            home_dev,
             probe,
             seen: Mutex::new(HashMap::new()),
         }
     }
 
     fn status(&self, project: &Path) -> GitTree {
-        if let Some(known) = self.lock().get(project) {
-            return *known;
-        }
-        // Not held across the probe. Two workers can both ask about the same
-        // project once, which costs a second `git status` and nothing else.
-        let status = self.probe.status(project);
-        self.lock().insert(project.to_path_buf(), status);
-        status
+        let cell = Arc::clone(self.lock().entry(project.to_path_buf()).or_default());
+        // The map is unlocked again. A second worker with the same project
+        // waits on this cell for the first one's answer, and workers with
+        // other projects do not wait at all.
+        *cell.get_or_init(|| self.probe.status(project))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, GitTree>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Arc<OnceLock<GitTree>>>> {
         self.seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -372,12 +376,7 @@ impl Chunk {
     }
 }
 
-fn eval_safe(
-    opts: &ScanOptions<'_>,
-    git: &GitCache<'_>,
-    rule: &SafeRule,
-    home_dev: Option<u64>,
-) -> Chunk {
+fn eval_safe(opts: &ScanOptions<'_>, shared: &Shared<'_>, rule: &SafeRule) -> Chunk {
     let mut chunk = Chunk::default();
     let relative = match rule.anchor {
         SafeAnchor::Directory(relative) | SafeAnchor::Files(relative) => relative,
@@ -390,25 +389,15 @@ fn eval_safe(
             return chunk;
         }
     };
-    // `~/.cargo` linked onto an external disk is that disk's business.
-    if !on_volume(opts.fs, &anchor, home_dev) {
-        return chunk;
-    }
 
     match rule.anchor {
         SafeAnchor::Directory(_) => {
             let candidate = safe_candidate(opts, rule, anchor, true);
-            consider(&mut chunk, opts, git, &candidate);
+            consider(&mut chunk, opts, shared, &candidate);
         }
-        SafeAnchor::Files(_) => eval_aged_files(&mut chunk, opts, git, rule, &anchor),
+        SafeAnchor::Files(_) => eval_aged_files(&mut chunk, opts, shared, rule, &anchor),
     }
     chunk
-}
-
-/// Whether `path` is on the home volume. An unknown home volume holds nothing.
-fn on_volume(fs: &dyn Fs, path: &Path, home_dev: Option<u64>) -> bool {
-    let dev = fs.meta(path).ok().map(|meta| meta.dev);
-    home_dev.is_some() && dev == home_dev
 }
 
 /// Where a safe rule's path really is, or `None` when it names nothing.
@@ -460,7 +449,7 @@ fn safe_locks(home: &Path, rule: &SafeRule) -> Vec<PathBuf> {
 fn eval_aged_files(
     chunk: &mut Chunk,
     opts: &ScanOptions<'_>,
-    git: &GitCache<'_>,
+    shared: &Shared<'_>,
     rule: &SafeRule,
     dir: &Path,
 ) {
@@ -481,7 +470,7 @@ fn eval_aged_files(
     }
     if meta.kind == Kind::File {
         let candidate = safe_candidate(opts, rule, dir.to_path_buf(), false);
-        consider_known(chunk, opts, git, &candidate, &meta);
+        consider_known(chunk, opts, shared, &candidate, &meta);
         return;
     }
     if meta.kind != Kind::Directory {
@@ -512,7 +501,7 @@ fn eval_aged_files(
             continue;
         }
         let candidate = safe_candidate(opts, rule, path, false);
-        consider_known(chunk, opts, git, &candidate, &child);
+        consider_known(chunk, opts, shared, &candidate, &child);
     }
 }
 
@@ -758,6 +747,8 @@ pub(crate) struct Claim<'a> {
     pub(crate) tier: Tier,
     /// Path the entry asks to move.
     pub(crate) path: &'a Path,
+    /// What is at that path now.
+    pub(crate) kind: Kind,
     /// Marker the entry recorded, for a caution rule.
     pub(crate) marker: Option<&'a Path>,
 }
@@ -772,7 +763,14 @@ pub(crate) struct RuleSet<'a> {
     pub(crate) project: &'a [ProjectRule],
 }
 
-/// Checks that a rule could have produced `claim` on the disk as it is now.
+/// Checks that a rule names `claim` on the disk as it is now.
+///
+/// The path has to be what the rule's own match would accept: the right
+/// name, in the right place, of the right kind, with its markers present.
+/// A caution project may not sit below a directory the walk prunes. The
+/// project roots and the walk's depth limit are not part of this: a caution
+/// directory outside every root still passes, and is still a build
+/// directory next to its marker.
 ///
 /// Returns the tool lock files to probe, or `None` when no rule admits the
 /// path. A plan file is text anyone can write, with an id anyone can
@@ -789,11 +787,14 @@ fn admit_safe(fs: &dyn Fs, rules: &RuleSet<'_>, claim: &Claim<'_>) -> Option<Vec
     let named = match rule.anchor {
         SafeAnchor::Directory(relative) => {
             let anchor = safe_anchor(fs, rules.home, relative).ok()??;
-            claim.path == anchor
+            claim.kind == Kind::Directory && claim.path == anchor
         }
+        // Only loose files. The directory stays, and so does anything in it
+        // that is not a regular file.
         SafeAnchor::Files(relative) => {
             let anchor = safe_anchor(fs, rules.home, relative).ok()??;
-            claim.path == anchor || claim.path.parent() == Some(anchor.as_path())
+            claim.kind == Kind::File
+                && (claim.path == anchor || claim.path.parent() == Some(anchor.as_path()))
         }
     };
     named.then(|| safe_locks(rules.home, rule))
@@ -801,10 +802,15 @@ fn admit_safe(fs: &dyn Fs, rules: &RuleSet<'_>, claim: &Claim<'_>) -> Option<Vec
 
 fn admit_caution(fs: &dyn Fs, rules: &RuleSet<'_>, claim: &Claim<'_>) -> Option<Vec<PathBuf>> {
     let rule = rules.project.iter().find(|rule| rule.id == claim.rule)?;
-    if claim.path.file_name()? != rule.child {
+    if claim.kind != Kind::Directory || claim.path.file_name()? != rule.child {
         return None;
     }
     let project = claim.path.parent()?;
+    // The walk never looks inside these, so no project it finds is below one.
+    // `node_modules/pkg/node_modules` belongs to the outer install.
+    if project.components().any(|part| pruned(part.as_os_str())) {
+        return None;
+    }
     let marker = claim.marker?;
     if marker.parent() != Some(project) {
         return None;
@@ -838,7 +844,7 @@ struct Candidate {
     locks: Vec<PathBuf>,
 }
 
-fn consider(chunk: &mut Chunk, opts: &ScanOptions<'_>, git: &GitCache<'_>, candidate: &Candidate) {
+fn consider(chunk: &mut Chunk, opts: &ScanOptions<'_>, shared: &Shared<'_>, candidate: &Candidate) {
     if path_is_denied(&candidate.path, opts.deny) {
         return;
     }
@@ -858,16 +864,23 @@ fn consider(chunk: &mut Chunk, opts: &ScanOptions<'_>, git: &GitCache<'_>, candi
         return;
     }
 
-    consider_known(chunk, opts, git, candidate, &meta);
+    consider_known(chunk, opts, shared, candidate, &meta);
 }
 
 fn consider_known(
     chunk: &mut Chunk,
     opts: &ScanOptions<'_>,
-    git: &GitCache<'_>,
+    shared: &Shared<'_>,
     candidate: &Candidate,
     meta: &EntryMeta,
 ) {
+    // Here and not earlier, because this is the first `lstat` of the path
+    // itself. `~/.cargo` linked onto an external disk, or a `target` that is
+    // a mount point, looks local until then. An unknown home volume holds nothing.
+    if Some(meta.dev) != shared.home_dev {
+        return;
+    }
+
     let measured = match measure(opts.fs, &candidate.path, meta) {
         Ok(measured) => measured,
         Err(err) if err.is_not_found() => return,
@@ -883,8 +896,10 @@ fn consider_known(
         return;
     }
 
-    // Age and lock first. `git status` is the expensive check, and a young or
-    // locked tree is already not staged.
+    // Lock and the tree's own problems first. `git status` is the expensive
+    // check, and a locked or unreadable tree is already not staged. A tree
+    // that is only young is still asked: the UI lets an operator override
+    // age, and must not hand them a dirty tree that was never looked at.
     let mut query = Gate {
         now: opts.now,
         tier: candidate.tier,
@@ -894,10 +909,10 @@ fn consider_known(
         git: None,
     };
     let mut skip = gate(&query);
-    if skip.is_none()
+    if matches!(skip, None | Some(Skip::Young))
         && let Some(project) = &candidate.project
     {
-        query.git = Some(git.status(project));
+        query.git = Some(shared.status(project));
         skip = gate(&query);
     }
 
@@ -990,6 +1005,14 @@ fn gate(query: &Gate<'_>) -> Option<Skip> {
     if newest > query.now {
         return Some(Skip::Future);
     }
+    // Before age. A dirty tree stays held when it gets old, and age is the
+    // one reason an operator may override.
+    match query.git {
+        Some(GitTree::Dirty) => return Some(Skip::Dirty),
+        Some(GitTree::Unknown) => return Some(Skip::GitUnknown),
+        Some(GitTree::Clean | GitTree::NotARepo) | None => {}
+    }
+
     let age = query
         .now
         .duration_since(newest)
@@ -1003,12 +1026,7 @@ fn gate(query: &Gate<'_>) -> Option<Skip> {
             Skip::Young
         });
     }
-
-    match query.git {
-        Some(GitTree::Dirty) => Some(Skip::Dirty),
-        Some(GitTree::Unknown) => Some(Skip::GitUnknown),
-        Some(GitTree::Clean | GitTree::NotARepo) | None => None,
-    }
+    None
 }
 
 #[cfg(test)]

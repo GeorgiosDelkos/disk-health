@@ -73,9 +73,11 @@ impl GitProbe for SystemGit {
 /// Options that go before the subcommand on every `git` this crate runs.
 ///
 /// `git status` refreshes the index when it can take the lock, and runs the
-/// program named by `core.fsmonitor` in the repository's own config. A scan
-/// writes nothing and runs nothing a repository chose.
-pub const READ_ONLY_OPTIONS: &[&str] = &["--no-optional-locks", "-c", "core.fsmonitor=false"];
+/// program named by `core.fsmonitor` in the repository's own config
+/// (`git help status`, `git help config`). These turn both off. They do not
+/// cover every program a repository can configure: a `filter` driver named
+/// in its attributes is still git's to run.
+const READ_ONLY_OPTIONS: &[&str] = &["--no-optional-locks", "-c", "core.fsmonitor=false"];
 
 fn read_only_git(directory: &Path) -> Command {
     let mut command = Command::new("git");
