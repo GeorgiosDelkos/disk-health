@@ -102,7 +102,9 @@ pub fn to_json(node: &UsageNode) -> String {
 
 fn refuse(root: &Path) -> Result<()> {
     let text = root.to_string_lossy();
-    let blocked = root == Path::new("/System")
+    // `/` reaches Data through firmlinks and would count it twice.
+    let blocked = root == Path::new("/")
+        || root == Path::new("/System")
         || root == Path::new("/System/Volumes/VM")
         || root == Path::new("/private/var/vm")
         || text.starts_with("/System/") && root != Path::new("/System/Volumes/Data");

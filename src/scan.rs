@@ -1,6 +1,9 @@
 //! Turn rules into findings.
 //!
 //! The scan is read-only. It does not create, rename, or remove anything.
+//! It only reads the volume the home directory is on. A project root or a
+//! cache on any other device, such as a USB disk, is refused before it is
+//! listed: those disks are slow to walk and are not what this tool reclaims.
 //! A finding is staged only when every gate for its tier passed. Review paths
 //! are not findings. [`crate::review`] owns that inventory, and [`Report::review`]
 //! starts empty so a scan cannot smuggle those rows into a plan.
@@ -100,7 +103,8 @@ pub struct Report {
     pub dirs_visited: u64,
     /// Requested project roots that do not exist.
     pub roots_missing: Vec<PathBuf>,
-    /// Requested project roots that sit on the denylist.
+    /// Requested project roots that sit on the denylist, or on another
+    /// volume than the home directory.
     pub roots_denied: Vec<PathBuf>,
     /// Review inventory. Empty until the caller fills it. Not part of a plan.
     pub review: Vec<crate::review::Item>,
@@ -140,7 +144,8 @@ impl Report {
 pub struct ScanOptions<'a> {
     /// Home directory safe rules are resolved against.
     pub home: &'a Path,
-    /// Project walk roots. Missing and denylisted roots are reported, not entered.
+    /// Project walk roots. A root that is missing, denylisted, or not on the
+    /// home volume is reported, not entered.
     pub roots: &'a [PathBuf],
     /// Safe rules to apply.
     pub safe_rules: &'a [SafeRule],
@@ -217,7 +222,9 @@ impl std::fmt::Debug for ScanOptions<'_> {
 /// ```
 pub fn scan(opts: &ScanOptions<'_>) -> Result<Report> {
     let git = GitCache::new(opts.git);
-    let mut chunk = run_workers(opts, &git)?;
+    // A home that cannot be stated has no volume, so nothing is on it.
+    let home_dev = opts.fs.meta(opts.home).ok().map(|meta| meta.dev);
+    let mut chunk = run_workers(opts, &git, home_dev)?;
 
     chunk.findings.sort_by(|left, right| {
         left.tier
@@ -250,7 +257,7 @@ const MAX_MEASURERS: usize = 8;
 /// Each safe rule has a thread, as before. The calling thread walks the
 /// project roots, which is cheap, and hands every candidate it finds to a
 /// pool that does the expensive part: measuring the tree and asking `git`.
-fn run_workers(opts: &ScanOptions<'_>, git: &GitCache<'_>) -> Result<Chunk> {
+fn run_workers(opts: &ScanOptions<'_>, git: &GitCache<'_>, home_dev: Option<u64>) -> Result<Chunk> {
     let (tx, rx) = mpsc::channel();
     let rx = Mutex::new(rx);
 
@@ -266,10 +273,12 @@ fn run_workers(opts: &ScanOptions<'_>, git: &GitCache<'_>) -> Result<Chunk> {
             handles.push(spawn(scope, opts, || measure_queue(opts, git, &rx))?);
         }
         for rule in opts.safe_rules {
-            handles.push(spawn(scope, opts, move || eval_safe(opts, git, rule))?);
+            handles.push(spawn(scope, opts, move || {
+                eval_safe(opts, git, rule, home_dev)
+            })?);
         }
 
-        let mut merged = discover_projects(opts, &tx);
+        let mut merged = discover_projects(opts, &tx, home_dev);
         drop(tx);
         for handle in handles {
             merged.merge(handle.join().expect("scan worker panicked"));
@@ -363,21 +372,28 @@ impl Chunk {
     }
 }
 
-fn eval_safe(opts: &ScanOptions<'_>, git: &GitCache<'_>, rule: &SafeRule) -> Chunk {
+fn eval_safe(
+    opts: &ScanOptions<'_>,
+    git: &GitCache<'_>,
+    rule: &SafeRule,
+    home_dev: Option<u64>,
+) -> Chunk {
     let mut chunk = Chunk::default();
     let relative = match rule.anchor {
         SafeAnchor::Directory(relative) | SafeAnchor::Files(relative) => relative,
     };
-    // Resolved before the denylist sees it. `~/.cache` may be a symlink, and
-    // the rule is about where the bytes are, not about the spelling.
-    let anchor = match opts.fs.canonical(&opts.home.join(relative)) {
-        Ok(anchor) => anchor,
-        Err(err) if err.is_not_found() => return chunk,
+    let anchor = match safe_anchor(opts.fs, opts.home, relative) {
+        Ok(Some(anchor)) => anchor,
+        Ok(None) => return chunk,
         Err(_) => {
             chunk.note_unreadable();
             return chunk;
         }
     };
+    // `~/.cargo` linked onto an external disk is that disk's business.
+    if !on_volume(opts.fs, &anchor, home_dev) {
+        return chunk;
+    }
 
     match rule.anchor {
         SafeAnchor::Directory(_) => {
@@ -387,6 +403,34 @@ fn eval_safe(opts: &ScanOptions<'_>, git: &GitCache<'_>, rule: &SafeRule) -> Chu
         SafeAnchor::Files(_) => eval_aged_files(&mut chunk, opts, git, rule, &anchor),
     }
     chunk
+}
+
+/// Whether `path` is on the home volume. An unknown home volume holds nothing.
+fn on_volume(fs: &dyn Fs, path: &Path, home_dev: Option<u64>) -> bool {
+    let dev = fs.meta(path).ok().map(|meta| meta.dev);
+    home_dev.is_some() && dev == home_dev
+}
+
+/// Where a safe rule's path really is, or `None` when it names nothing.
+///
+/// A directory above the anchor may be a symlink: a relocated `~/.cache` is
+/// still the cache, and resolving it is what lets the denylist see where
+/// the bytes are. The anchor itself may not be. A link there would point the
+/// rule at whatever it names, and `~/.cache/uv -> ~/Documents` must not make
+/// a cache out of a home folder.
+fn safe_anchor(fs: &dyn Fs, home: &Path, relative: &str) -> Result<Option<PathBuf>> {
+    let named = home.join(relative);
+    match fs.meta(&named) {
+        Ok(meta) if meta.kind == Kind::Symlink => return Ok(None),
+        Ok(_) => {}
+        Err(err) if err.is_not_found() => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    match fs.canonical(&named) {
+        Ok(anchor) => Ok(Some(anchor)),
+        Err(err) if err.is_not_found() => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn safe_candidate(
@@ -472,7 +516,11 @@ fn eval_aged_files(
     }
 }
 
-fn discover_projects(opts: &ScanOptions<'_>, queue: &mpsc::Sender<Candidate>) -> Chunk {
+fn discover_projects(
+    opts: &ScanOptions<'_>,
+    queue: &mpsc::Sender<Candidate>,
+    home_dev: Option<u64>,
+) -> Chunk {
     let mut chunk = Chunk::default();
     for root in opts.roots {
         if path_is_denied(root, opts.deny) {
@@ -486,6 +534,7 @@ fn discover_projects(opts: &ScanOptions<'_>, queue: &mpsc::Sender<Candidate>) ->
             }
             Err(_) => chunk.note_unreadable(),
             Ok(meta) if meta.kind != Kind::Directory || meta.is_dataless() => {}
+            Ok(meta) if Some(meta.dev) != home_dev => chunk.roots_denied.push(root.clone()),
             Ok(meta) => {
                 let walk = ProjectWalk {
                     opts,
@@ -739,11 +788,11 @@ fn admit_safe(fs: &dyn Fs, rules: &RuleSet<'_>, claim: &Claim<'_>) -> Option<Vec
     let rule = rules.safe.iter().find(|rule| rule.id == claim.rule)?;
     let named = match rule.anchor {
         SafeAnchor::Directory(relative) => {
-            let anchor = fs.canonical(&rules.home.join(relative)).ok()?;
+            let anchor = safe_anchor(fs, rules.home, relative).ok()??;
             claim.path == anchor
         }
         SafeAnchor::Files(relative) => {
-            let anchor = fs.canonical(&rules.home.join(relative)).ok()?;
+            let anchor = safe_anchor(fs, rules.home, relative).ok()??;
             claim.path == anchor || claim.path.parent() == Some(anchor.as_path())
         }
     };

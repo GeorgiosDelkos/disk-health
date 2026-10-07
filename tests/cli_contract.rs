@@ -1,7 +1,7 @@
 //! CLI contract for plan files, apply, and usage.
 //!
-//! Every test passes `--home` and, for scans, `--root`. The defaults would
-//! walk this machine, including `/Volumes/Source`.
+//! Every test passes `--home` and, for scans, `--root`, so none of them
+//! reads the real home directory.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -189,6 +189,73 @@ fn wrong_confirm_moves_nothing() {
 }
 
 #[test]
+fn scan_plan_apply_restore_round_trip() {
+    let scratch = Scratch::new("round-trip");
+    let home = scratch.path.join("home");
+    let projects = scratch.path.join("projects");
+    let cache = home.join(".cargo/registry");
+    let blob = cache.join("crate.tar");
+    let plan_path = scratch.path.join("plan.json");
+    fs::create_dir_all(&cache).unwrap();
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(&blob, b"crate-bytes").unwrap();
+    set_tree_mtime(&home, SystemTime::now() - Duration::from_hours(30 * 24));
+
+    // `--home` is under `/var`, a symlink. The plan has to name the
+    // canonical path or apply will not move it.
+    let home_arg = home.display().to_string();
+    let scanned = run(&[
+        own("scan"),
+        own("--home"),
+        home_arg.clone(),
+        own("--root"),
+        projects.display().to_string(),
+        own("--plan"),
+        plan_path.display().to_string(),
+    ]);
+    assert!(scanned.status.success(), "{}", explain(&scanned));
+    let plan = read_plan(&plan_path);
+
+    let applied = run(&[
+        own("apply"),
+        own("--home"),
+        home_arg.clone(),
+        own("--plan"),
+        plan_path.display().to_string(),
+        own("--confirm"),
+        plan.plan_id.clone(),
+    ]);
+    assert_eq!(applied.status.code(), Some(0), "{}", explain(&applied));
+    assert!(!cache.exists());
+    let trashed = fs::read_dir(home.join(".Trash"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(trashed.len(), 1, "{trashed:?}");
+    assert_eq!(
+        fs::read(trashed[0].join("crate.tar")).unwrap(),
+        b"crate-bytes"
+    );
+
+    let log = home.join("Library/Application Support/disk-health/actions.jsonl");
+    let line = fs::read_to_string(log).unwrap();
+    let id = line
+        .split("\"id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the action line starts with its id");
+    let restored = run(&[
+        own("restore"),
+        own("--home"),
+        home_arg,
+        own("--id"),
+        own(id),
+    ]);
+    assert!(restored.status.success(), "{}", explain(&restored));
+    assert_eq!(fs::read(&blob).unwrap(), b"crate-bytes");
+}
+
+#[test]
 fn usage_of_a_temp_volume_has_no_staged_key() {
     let scratch = Scratch::new("usage");
     let home = scratch.path.join("home");
@@ -212,6 +279,25 @@ fn usage_of_a_temp_volume_has_no_staged_key() {
     assert!(stdout.contains("blob.bin"), "{stdout}");
     assert!(!stdout.contains("\"staged\""), "{stdout}");
     assert!(!stdout.contains("\"tier\""), "{stdout}");
+}
+
+#[test]
+fn usage_of_another_volume_is_refused() {
+    let scratch = Scratch::new("usage-other");
+    let home = scratch.path.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    // `/dev` is devfs, which is never the device a home directory is on.
+    let output = run(&[
+        own("usage"),
+        own("--home"),
+        home.display().to_string(),
+        own("--volume"),
+        own("/dev"),
+    ]);
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", explain(&output));
+    assert!(stderr.contains("not on the home volume"), "{stderr}");
 }
 
 #[test]

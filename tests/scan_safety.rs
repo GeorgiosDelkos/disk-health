@@ -582,6 +582,36 @@ fn mount_point_listed_as_a_plain_directory_is_not_entered() {
     assert_eq!(tree.apparent_bytes, 2 * (2 + 43 + 8));
 }
 
+#[test]
+fn another_disk_is_not_scanned() {
+    let fs = MemFs::new();
+    fs.dir("/h", 1, old());
+    // A project root on a USB disk.
+    fs.dir("/usb", 2, old());
+    fs.dir("/usb/crate", 2, old());
+    fs.file("/usb/crate/Cargo.toml", 2, 2, old());
+    fs.dir("/usb/crate/target", 2, old());
+    fs.file("/usb/crate/target/CACHEDIR.TAG", 2, 43, old());
+    // A cache that was moved onto it.
+    fs.dir("/h/cache", 2, old());
+    fs.file("/h/cache/blob", 2, 4_000, old());
+
+    let home = PathBuf::from("/h");
+    let roots = [PathBuf::from("/usb")];
+    let report = run(
+        &fs,
+        &MapGit::default(),
+        &home,
+        &roots,
+        &[fixture_rule("cache")],
+        &rules::builtin_project(),
+        &deny_prefixes(&home, &[]),
+    );
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    assert_eq!(report.roots_denied, roots);
+    assert_eq!(report.dirs_visited, 0);
+}
+
 /// Counts how often the scan asks about a project.
 #[derive(Default)]
 struct CountingGit(std::sync::atomic::AtomicUsize);
@@ -715,6 +745,47 @@ fn random_trees_never_stage_a_symlink_or_a_denied_path() {
             );
         }
     }
+}
+
+#[test]
+fn symlink_above_a_cache_is_followed_and_a_symlink_at_it_is_not() {
+    let temp = TempDir::new("anchor");
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let home = root.join("home");
+    let disk = root.join("other-disk");
+    let precious = root.join("precious");
+    fs::create_dir_all(home.join("direct")).unwrap();
+    fs::create_dir_all(disk.join("cache")).unwrap();
+    fs::create_dir_all(&precious).unwrap();
+    fs::write(disk.join("cache/blob"), b"refillable").unwrap();
+    fs::write(precious.join("thesis.txt"), b"keep").unwrap();
+    // `~/moved/cache` is a real directory on another disk.
+    std::os::unix::fs::symlink(&disk, home.join("moved")).unwrap();
+    // `~/direct/cache` is a link, and a link can name anything.
+    std::os::unix::fs::symlink(&precious, home.join("direct/cache")).unwrap();
+    set_tree_mtime(&root, old());
+
+    let rules = [fixture_rule("moved/cache"), fixture_rule("direct/cache")];
+    let report = scan(&ScanOptions {
+        home: &home,
+        roots: &[],
+        safe_rules: &rules,
+        project_rules: &[],
+        deny: &deny_prefixes(&home, &[]),
+        now: now(),
+        git: &MapGit::default(),
+        fs: &RealFs,
+        progress: None,
+        on_finding: None,
+    })
+    .expect("a scan worker can be spawned");
+
+    let paths = report
+        .findings
+        .iter()
+        .map(|finding| finding.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, [disk.join("cache")], "{:?}", report.findings);
 }
 
 /// xorshift64. The seed is printed when an assertion fails.

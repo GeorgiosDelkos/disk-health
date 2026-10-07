@@ -160,6 +160,9 @@ pub fn load(home: &Path) -> Result<Loaded> {
 
 /// Default project roots when the user has no `roots` file.
 ///
+/// Both are under home. The scan only reads the volume home is on, so a
+/// root on an external disk would be refused anyway.
+///
 /// # Examples
 ///
 /// ```
@@ -171,11 +174,7 @@ pub fn load(home: &Path) -> Result<Loaded> {
 /// ```
 #[must_use]
 pub fn default_roots(home: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join("Documents/Github"),
-        home.join("Documents/Source"),
-        PathBuf::from("/Volumes/Source"),
-    ]
+    vec![home.join("Documents/Github"), home.join("Documents/Source")]
 }
 
 /// Builtin denylist plus `extra` exclude prefixes.

@@ -42,6 +42,8 @@ SIZE is 500MiB or 20GiB (1024-based).
 Exit 2 when staged safe bytes exceed --fail-over.
 Exit 3 when apply skips a staged entry or cannot log a move.
 --root replaces project roots and may be repeated.
+Only the volume the home directory is on is read. A root, a cache, or a
+usage volume on another disk is refused.
 --plan writes the plan file. It does not delete anything.
 A terminal is required for the tui. Otherwise run scan --format text.
 ";
@@ -559,7 +561,6 @@ fn execute_apply(flags: &ApplyFlags) -> Result<i32> {
         confirm: &flags.confirm,
         home: &home,
         home_dev: home_meta.dev,
-        uid: volumes::current_uid(),
         deny: &loaded.deny,
         safe_rules: &loaded.safe_rules,
         project_rules: &loaded.project_rules,
@@ -626,11 +627,20 @@ fn execute_usage(flags: &UsageFlags) -> Result<i32> {
 }
 
 fn choose_volume(home: &Path, requested: Option<&Path>) -> Result<PathBuf> {
+    let home_dev = RealFs.meta(home)?.dev;
     if let Some(volume) = requested {
+        // Same rule as the scan: only the disk home is on is read.
+        if RealFs.meta(volume)?.dev != home_dev {
+            return Err(Error::Usage {
+                message: format!(
+                    "usage refuses {}: it is not on the home volume",
+                    volume.display()
+                ),
+            });
+        }
         return Ok(volume.to_path_buf());
     }
     let mounts = volumes::list_mounts()?;
-    let home_dev = RealFs.meta(home)?.dev;
     volumes::home_volume(home_dev, &mounts)
         .map(|volume| volume.mount.clone())
         .ok_or_else(|| Error::Usage {

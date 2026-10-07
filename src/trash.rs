@@ -1,5 +1,8 @@
 //! Move a staged plan entry onto the same volume, or leave it alone.
 //!
+//! Only the volume the home directory is on is touched. An entry on any
+//! other device is skipped, so the trash is always `~/.Trash`.
+//!
 //! The only mutation is `rename`. A cross-device error is a skip: nothing is
 //! copied and nothing is unlinked. `purge` is the only unlink, and it only
 //! unlinks a path whose canonical location is still inside a quarantine
@@ -100,10 +103,8 @@ pub struct ApplyRequest<'a> {
     pub confirm: &'a str,
     /// Home directory. Its `.Trash` is the same-volume trash.
     pub home: &'a Path,
-    /// `st_dev` of `home`.
+    /// `st_dev` of `home`. An entry on another device is not moved.
     pub home_dev: u64,
-    /// `getuid`, used for `/.Trashes/<uid>` on other volumes.
-    pub uid: u32,
     /// Prefixes that are never moved, even if the plan names them.
     pub deny: &'a [PathBuf],
     /// Safe rules. An entry is moved only when one of these names its path.
@@ -129,7 +130,6 @@ impl std::fmt::Debug for ApplyRequest<'_> {
             .field("confirm", &self.confirm)
             .field("home", &self.home)
             .field("home_dev", &self.home_dev)
-            .field("uid", &self.uid)
             .field("now", &self.now)
             .finish_non_exhaustive()
     }
@@ -186,6 +186,8 @@ pub enum SkipMove {
     Partial,
     /// The path is on the denylist or is not absolute.
     Denied,
+    /// The path is not on the volume the home directory is on.
+    OtherVolume,
     /// The path is not canonical: it goes through a symlink, or is spelled
     /// in a different case than the disk stores.
     NotCanonical,
@@ -235,6 +237,7 @@ impl std::fmt::Display for SkipMove {
             Self::Newer => formatter.write_str("a child is newer than the scan"),
             Self::Partial => formatter.write_str("tree could not be reread"),
             Self::Denied => formatter.write_str("path is denied"),
+            Self::OtherVolume => formatter.write_str("path is not on the home volume"),
             Self::NotCanonical => formatter.write_str("path is not canonical"),
             Self::Rule => formatter.write_str("no rule names this path"),
             Self::Marker => formatter.write_str("caution entry has no marker"),
@@ -272,7 +275,6 @@ impl std::fmt::Display for SkipMove {
 ///     confirm: "nope",
 ///     home: Path::new("/home"),
 ///     home_dev: 1,
-///     uid: 0,
 ///     deny: &[],
 ///     safe_rules: &[],
 ///     project_rules: &[],
@@ -325,7 +327,6 @@ pub fn apply(mut request: ApplyRequest<'_>) -> Result<ApplyReport> {
 ///         confirm: plan.plan_id.as_str(),
 ///         home: Path::new("/home"),
 ///         home_dev: 1,
-///         uid: 0,
 ///         deny: &[],
 ///         safe_rules: &[],
 ///         project_rules: &[],
@@ -401,6 +402,10 @@ fn revalidate(request: &ApplyRequest<'_>, entry: &Entry) -> Option<SkipMove> {
     };
     if let Some(reason) = wrong_object(entry, &meta) {
         return Some(reason);
+    }
+    // After the identity check, so this is the device of the scanned object.
+    if meta.dev != request.home_dev {
+        return Some(SkipMove::OtherVolume);
     }
     let locks = match admitted(request, entry) {
         Ok(locks) => locks,
@@ -493,13 +498,8 @@ fn choose_dest(
     index: usize,
 ) -> std::result::Result<PathBuf, SkipMove> {
     let volume = volume_root(request.fs, &entry.path).map_err(|_| SkipMove::Partial)?;
-    let trash = platform_trash(
-        request.home,
-        request.home_dev,
-        request.uid,
-        entry.dev,
-        &volume,
-    );
+    // Every entry that reaches here is on the home volume.
+    let trash = request.home.join(".Trash");
     if let Some(dir) = prepare_dir(&trash) {
         return Ok(indexed_path(&dir, &entry.path, index));
     }
@@ -566,14 +566,6 @@ fn volume_root(fs: &dyn Fs, path: &Path) -> Result<PathBuf> {
         current = parent.to_path_buf();
     }
     Ok(current)
-}
-
-fn platform_trash(home: &Path, home_dev: u64, uid: u32, dev: u64, volume: &Path) -> PathBuf {
-    if dev == home_dev {
-        home.join(".Trash")
-    } else {
-        volume.join(".Trashes").join(uid.to_string())
-    }
 }
 
 fn prepare_dir(path: &Path) -> Option<PathBuf> {

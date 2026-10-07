@@ -139,7 +139,6 @@ fn apply_real(
         confirm,
         home,
         home_dev,
-        uid: 501,
         deny: &deny_prefixes(home, &[]),
         safe_rules: &fixture_rules(),
         project_rules: &rules::builtin_project(),
@@ -407,7 +406,6 @@ fn denied_plan_path_is_not_moved() {
         confirm: &plan.plan_id,
         home: &home,
         home_dev: 1,
-        uid: 501,
         deny: &deny,
         safe_rules: &fixture_rules(),
         project_rules: &[],
@@ -422,6 +420,55 @@ fn denied_plan_path_is_not_moved() {
     assert_eq!(renamer.calls(), 0);
     assert!(matches!(report.skipped[0].reason, SkipMove::Denied));
     assert_eq!(report.exit_code(), 3);
+}
+
+#[test]
+fn entry_on_another_disk_is_not_moved() {
+    let fs = disk_health::walk::MemFs::new();
+    let when = now() - Duration::from_hours(48);
+    fs.dir("/h", 1, when);
+    // The rule names this path. It is on device 2, and home is on device 1.
+    fs.dir("/h/cache", 2, when);
+    let meta = fs.meta(Path::new("/h/cache")).unwrap();
+    let entry = Entry {
+        rule: "fixture".to_owned(),
+        tier: Tier::Safe,
+        path: PathBuf::from("/h/cache"),
+        dev: meta.dev,
+        ino: meta.ino,
+        mtime_ns: meta.mtime.and_then(unix_nanos),
+        newest_child_ns: meta.mtime.and_then(unix_nanos),
+        apparent_bytes: 1,
+        staged: true,
+        regenerate: None,
+        marker: None,
+    };
+    let plan = Plan::from_entries(vec![entry], "host", now());
+    let home = PathBuf::from("/h");
+    let renamer = Recorded(Mutex::new(Vec::new()));
+    let mut log = MemoryLog::default();
+    let report = apply(ApplyRequest {
+        plan: &plan,
+        confirm: &plan.plan_id,
+        home: &home,
+        home_dev: 1,
+        deny: &deny_prefixes(&home, &[]),
+        safe_rules: &fixture_rules(),
+        project_rules: &[],
+        fs: &fs,
+        renamer: &renamer,
+        log: &mut log,
+        now: now(),
+        interrupt: None,
+    })
+    .unwrap();
+
+    assert_eq!(renamer.calls(), 0);
+    assert!(
+        matches!(report.skipped[0].reason, SkipMove::OtherVolume),
+        "{:?}",
+        report.skipped
+    );
 }
 
 #[test]
@@ -461,7 +508,6 @@ fn interrupt_stops_before_a_rename() {
         confirm: &plan.plan_id,
         home: &home,
         home_dev,
-        uid: 501,
         deny: &deny,
         safe_rules: &fixture_rules(),
         project_rules: &[],
@@ -504,6 +550,30 @@ fn path_no_rule_produces_is_not_moved() {
         );
     }
     assert_eq!(fs::read(documents.join("thesis.txt")).unwrap(), b"keep");
+}
+
+#[test]
+fn target_of_a_symlink_at_the_rule_path_is_not_moved() {
+    let fixture = TempDir::new("anchorlink");
+    let home = fixture.path().join("home");
+    let precious = fixture.path().join("precious");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&precious).unwrap();
+    fs::write(precious.join("thesis.txt"), b"keep").unwrap();
+    // The fixture rule names `~/cache`, and `~/cache` is a link to this.
+    std::os::unix::fs::symlink(&precious, home.join("cache")).unwrap();
+
+    let plan = Plan::from_entries(vec![entry_at(&precious, true, None)], "host", now());
+    let renamer = Recorded(Mutex::new(Vec::new()));
+    let mut log = MemoryLog::default();
+    let report = apply_real(&plan, &plan.plan_id, &home, &renamer, &mut log).unwrap();
+
+    assert_eq!(renamer.calls(), 0);
+    assert!(
+        matches!(report.skipped[0].reason, SkipMove::Rule),
+        "{:?}",
+        report.skipped
+    );
 }
 
 #[test]

@@ -1101,7 +1101,8 @@ struct Background {
 fn drive(session: &Session<'_>) -> crate::Result<i32> {
     let loaded = crate::config::load(session.home)?;
     let (roots, denied) = crate::config::prepare_roots(&loaded.roots, &loaded.deny)?;
-    let volumes = crate::volumes::list_mounts()?;
+    let home_dev = crate::walk::RealFs.meta(session.home)?.dev;
+    let volumes = crate::volumes::confine_to(crate::volumes::list_mounts()?, home_dev);
     let palette = palette_from(session.colorterm, session.term, session.no_color);
     let mut model = Model::new(volumes, Vec::new(), Vec::new(), palette, SystemTime::now());
     model.set_home(session.home);
@@ -1317,7 +1318,6 @@ fn apply_plan(
             confirm: "",
             home,
             home_dev: home_meta.dev,
-            uid: crate::volumes::current_uid(),
             deny: &loaded.deny,
             safe_rules: &loaded.safe_rules,
             project_rules: &loaded.project_rules,

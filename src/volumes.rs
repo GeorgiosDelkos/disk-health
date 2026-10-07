@@ -222,13 +222,17 @@ pub const STATFS_LEN: usize = STATFS_SIZE;
 /// `/System/Volumes/Data`, so no mount point is a prefix of a home directory
 /// except `/`, and `/` is the sealed system volume.
 ///
+/// `/` and the Data volume can report the same device. The deeper mount
+/// wins, and `/` is not walkable in any case: its firmlinks would count
+/// everything under Data a second time.
+///
 /// # Examples
 ///
 /// ```
 /// use disk_health::volumes::{Volume, home_volume};
 /// use std::path::Path;
 ///
-/// let volumes = vec![volume("/", 1), volume("/System/Volumes/Data", 2)];
+/// let volumes = vec![volume("/Volumes/Other", 2), volume("/System/Volumes/Data", 2)];
 /// let found = home_volume(2, &volumes);
 /// assert_eq!(
 ///     found.map(|item| item.mount.as_path()),
@@ -252,7 +256,43 @@ pub const STATFS_LEN: usize = STATFS_SIZE;
 pub fn home_volume(home_dev: u64, volumes: &[Volume]) -> Option<&Volume> {
     volumes
         .iter()
-        .find(|volume| volume.walkable && volume.dev == home_dev)
+        .filter(|volume| volume.walkable && volume.dev == home_dev)
+        .max_by_key(|volume| volume.mount.components().count())
+}
+
+/// Marks every mount that is not on device `home_dev` as not walkable.
+///
+/// The tool reads the disk the home directory is on and no other. A USB
+/// disk stays in the list, dimmed, so the screen still accounts for it.
+///
+/// # Examples
+///
+/// ```
+/// use disk_health::volumes::{MountRaw, confine_to, describe};
+///
+/// let usb = describe(&MountRaw {
+///     mount: "/Volumes/Backup".to_owned(),
+///     fstype: "apfs".to_owned(),
+///     flags: 0x1000,
+///     fsid: 9,
+///     bsize: 4096,
+///     blocks: 10,
+///     bfree: 4,
+///     bavail: 3,
+/// });
+/// assert!(usb.walkable);
+/// let confined = confine_to(vec![usb], 7);
+/// assert!(!confined[0].walkable);
+/// ```
+#[must_use]
+pub fn confine_to(mut volumes: Vec<Volume>, home_dev: u64) -> Vec<Volume> {
+    for volume in &mut volumes {
+        if volume.walkable && volume.dev != home_dev {
+            volume.walkable = false;
+            volume.note = Some("not the home volume");
+        }
+    }
+    volumes
 }
 
 fn classify(mount: &str, fstype: &str, flags: u32) -> (bool, Option<&'static str>) {
@@ -287,6 +327,11 @@ fn refused_mount(mount: &str) -> Option<&'static str> {
     }
     if mount == "/System" || (mount.starts_with("/System/") && mount != "/System/Volumes/Data") {
         return Some("system or vm volume");
+    }
+    // The sealed system volume. `/Users` and friends are firmlinks from it
+    // into Data, so walking from here counts Data twice.
+    if mount == "/" {
+        return Some("system volume; its files are under Data");
     }
     None
 }
@@ -417,6 +462,7 @@ mod tests {
         let home_dev = std::fs::metadata(&home).unwrap().st_dev();
         let found = home_volume(home_dev, &mounts).expect("the home volume is walkable");
         assert_eq!(std::fs::metadata(&found.mount).unwrap().st_dev(), home_dev);
+        assert_ne!(found.mount, std::path::Path::new("/"));
     }
 
     #[test]
@@ -433,6 +479,8 @@ mod tests {
     fn system_devfs_and_remote_are_not_walkable() {
         let system = describe(&parse_statfs(&record("apfs", "/System", MNT_LOCAL)).unwrap());
         assert!(!system.walkable);
+        let root = describe(&parse_statfs(&record("apfs", "/", MNT_LOCAL)).unwrap());
+        assert!(!root.walkable);
         let devfs = describe(&parse_statfs(&record("devfs", "/dev", MNT_LOCAL)).unwrap());
         assert!(!devfs.walkable);
         let hidden = describe(
